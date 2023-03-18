@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 
-from utils import klcpd, tscp, cpd_models
+from utils import cpd_models #, klcpd, tscp
 
 #------------------------------------------------------------------------------------------------------------#
 #                         Evaluate seq2seq, KL-CPD and TS-CP2 baseline models                                #
@@ -145,10 +145,14 @@ def get_models_predictions(
                 outs.append(out)
         outs = torch.stack(outs)
         true_labels = torch.stack(true_labels)                
-    elif model_type == 'tscp':
-        outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
-    elif model_type == 'kl_cpd':
-        outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+    #elif model_type == 'tscp':
+    #    outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+    #elif model_type == 'kl_cpd':
+    #    outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+    elif model_type == "ensemble":
+        # take mean values
+        model.predict(inputs)
+        outs = model.preds_mean
     else:
         outs = model(inputs)
     return outs, true_labels
