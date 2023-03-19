@@ -151,8 +151,7 @@ def get_models_predictions(
     #    outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
     elif model_type == "ensemble":
         # take mean values
-        model.predict(inputs)
-        outs = model.preds_mean
+        outs = model.predict(inputs)[0]
     else:
         outs = model(inputs)
     return outs, true_labels
@@ -544,7 +543,8 @@ def write_metrics_to_file(
     filename: str,
     metrics: tuple,
     seed: int,
-    timestamp: str
+    timestamp: str,
+    sample_size: int=None
 ) -> None:
     """Write metrics to a .txt file.
 
@@ -556,6 +556,7 @@ def write_metrics_to_file(
     best_th_f1, best_time_to_FA, best_delay, auc, best_conf_matrix, best_f1, best_cover, best_th_cover, max_cover = metrics
     
     with open(filename, 'a') as f:
+        f.writelines('Sample size: {}\n'.format(sample_size))
         f.writelines('SEED: {}\n'.format(seed))
         f.writelines('Timestamp: {}\n'.format(timestamp))
         f.writelines('AUC: {}\n'.format(auc))
