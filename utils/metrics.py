@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytorch_lightning as pl
 
-from utils import cpd_models #, klcpd, tscp
+from utils import cpd_models, klcpd, tscp
 
 #------------------------------------------------------------------------------------------------------------#
 #                         Evaluate seq2seq, KL-CPD and TS-CP2 baseline models                                #
@@ -105,7 +105,9 @@ def get_models_predictions(
     model_type: str = 'seq2seq',
     subseq_len: int = None,
     device: str = 'cuda',
-    scale: int = None
+    scale: int = None,
+
+    q: float = None
 ) -> List[torch.Tensor]:
     """Get model's prediction.
 
@@ -133,7 +135,9 @@ def get_models_predictions(
                 out = [model(inp[:, i].unsqueeze(0).float()).squeeze() for i in range(0, len(inp))]
                 
             elif (model_type == 'weak_labels') and (subseq_len is not None):
-                out_end = [model(inp[i: i + subseq_len].flatten(1).unsqueeze(0).float()) for i in range(0, len(inp) - subseq_len)]
+                out_end = [
+                    model(inp[i: i + subseq_len].flatten(1).unsqueeze(0).float()) for i in range(0, len(inp) - subseq_len)
+                ]
                 out = [torch.zeros(len(lab) - len(out_end), 1, device=device)]                
                 out.extend(out_end)
                 out = torch.cat(out)
@@ -144,17 +148,31 @@ def get_models_predictions(
             except:
                 outs.append(out)
         outs = torch.stack(outs)
-        true_labels = torch.stack(true_labels)                
-    #elif model_type == 'tscp':
-    #    outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
-    #elif model_type == 'kl_cpd':
-    #    outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+        true_labels = torch.stack(true_labels)
+        
+        # no uncertainty for these models
+        uncertainties = None
+        
+    elif model_type == 'tscp':
+        outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+        uncertainties = None
+    elif model_type == 'kl_cpd':
+        outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+        uncertainties = None
     elif model_type == "ensemble":
-        # take mean values
-        outs = model.predict(inputs)[0]
+        # take mean values and std (as uncertainty measure)
+        outs, uncertainties = model.predict(inputs)
+    elif model_type == "ensemble_quantile":
+        outs = model.get_quantile_predictions(inputs, q)
+        uncertainties = None
+    elif model_type == "cusum_aggr":
+        outs = model.predict(inputs)
+        uncertainties = None 
     else:
         outs = model(inputs)
-    return outs, true_labels
+        uncertainties = None
+        
+    return outs, uncertainties, true_labels
 
 def evaluate_metrics_on_set(
     model: nn.Module,
@@ -164,7 +182,11 @@ def evaluate_metrics_on_set(
     model_type: str = 'seq2seq',
     subseq_len: int = None, 
     device: str = 'cuda',
-    scale: int = None
+    scale: int = None,
+    
+    uncert_th: float = None,
+    q: float = None
+    
 ) -> Tuple[int, int, int, int, float, float]:
     """Calculate metrics for CPD.
 
@@ -193,22 +215,35 @@ def evaluate_metrics_on_set(
     with torch.no_grad():
             
         for test_inputs, test_labels in test_loader:
-            test_out, test_labels = get_models_predictions(test_inputs, test_labels, 
-                                                           model, 
-                                                           model_type=model_type, 
-                                                           subseq_len=subseq_len, 
-                                                           device=device,
-                                                           scale=scale)
+            test_out, test_uncertainties, test_labels = get_models_predictions(
+                test_inputs, test_labels,
+                model,
+                model_type=model_type,
+                subseq_len=subseq_len,
+                device=device,
+                scale=scale,
+                q=q
+            )
 
             try:
                 test_out = test_out.squeeze(2)
+                test_uncertainties = test_uncertainties.squeeze(2)
             except:
                 try:
                     test_out = test_out.squeeze(1)
+                    test_uncertainties = test_uncertainties.squeeze(1)
                 except:
                     test_out = test_out
-
-            tn, fp, fn, tp, FP_delay, delay, cover = calculate_metrics(test_labels, test_out > threshold)     
+                    test_uncertainties = test_uncertainties
+            
+            if test_uncertainties is not None and uncert_th is not None:
+                cropped_outs = (test_out > threshold) & (test_uncertainties < uncert_th)
+            else:
+                cropped_outs = test_out > threshold
+            
+            tn, fp, fn, tp, FP_delay, delay, cover = calculate_metrics(
+                test_labels, cropped_outs
+            )     
 
             del test_labels
             del test_out
@@ -248,6 +283,7 @@ def evaluate_metrics_on_set(
         torch.cuda.empty_cache()         
 
     return TN, FP, FN, TP, mean_delay, mean_FP_delay, mean_cover
+
 
 def area_under_graph(delay_list: List[float], fp_delay_list: List[float]) -> float:
     """Calculate area under Delay - FP delay curve.
@@ -348,7 +384,11 @@ def evaluation_pipeline(
     verbose: bool = False, 
     model_type: str = 'seq2seq',
     subseq_len: int = None,
-    scale: int = None
+    scale: int = None,
+
+    uncert_th: float = None,
+    q: float = None
+    
 ) -> Tuple[Tuple[float], dict, dict]:
     """Evaluate trained CPD model.
 
@@ -382,7 +422,12 @@ def evaluation_pipeline(
     
     delay_dict = {}
     fp_delay_dict = {}
-    confusion_matrix_dict = {}    
+    confusion_matrix_dict = {}
+
+    if model_type == "cusum_aggr":
+        threshold_list = [0.5]
+        if verbose and len(threshold_list) > 1:
+            print("No need in threshold list for CUSUM. Take threshold = 0.5.")
 
     for threshold in tqdm(threshold_list):
         (
@@ -401,7 +446,9 @@ def evaluation_pipeline(
             model_type=model_type,
             subseq_len=subseq_len,
             device=device,
-            scale=scale
+            scale=scale,
+            uncert_th=uncert_th,
+            q=q
             )
 
         confusion_matrix_dict[threshold] = (TN, FP, FN, TP)
@@ -410,8 +457,11 @@ def evaluation_pipeline(
         
         cover_dict[threshold] = cover
         f1_dict[threshold] = F1_score((TN, FP, FN, TP))
-            
-    auc = area_under_graph(list(delay_dict.values()), list(fp_delay_dict.values()))
+
+    if model_type == "cusum_aggr":
+        auc = None
+    else:
+        auc = area_under_graph(list(delay_dict.values()), list(fp_delay_dict.values()))
 
     # Conf matrix and F1
     best_th_f1 = max(f1_dict, key=f1_dict.get)
@@ -432,7 +482,7 @@ def evaluation_pipeline(
 
     
     if verbose:
-        print('AUC:', round(auc, 4))
+        print('AUC:', round(auc, 4) if auc is not None else auc)
         print('Time to FA {}, delay detection {} for best-F1 threshold: {}'. format(round(best_time_to_FA, 4), 
                                                                                     round(best_delay, 4), 
                                                                                     round(best_th_f1, 4)))
@@ -544,7 +594,7 @@ def write_metrics_to_file(
     metrics: tuple,
     seed: int,
     timestamp: str,
-    sample_size: int=None
+    comment: str=None,
 ) -> None:
     """Write metrics to a .txt file.
 
@@ -552,11 +602,12 @@ def write_metrics_to_file(
     :param metrics: tuple of metrics (output of the 'evaluation_pipeline' function)
     :param seed: initialization seed for the model under evaluation
     :param timestamp: timestamp indicating which model was evaluated
+    :param comment: any additional information about the experiment
     """
     best_th_f1, best_time_to_FA, best_delay, auc, best_conf_matrix, best_f1, best_cover, best_th_cover, max_cover = metrics
     
     with open(filename, 'a') as f:
-        f.writelines('Sample size: {}\n'.format(sample_size))
+        f.writelines('Comment: {}\n'.format(comment))
         f.writelines('SEED: {}\n'.format(seed))
         f.writelines('Timestamp: {}\n'.format(timestamp))
         f.writelines('AUC: {}\n'.format(auc))
