@@ -106,7 +106,6 @@ def get_models_predictions(
     subseq_len: int = None,
     device: str = 'cuda',
     scale: int = None,
-
     q: float = None
 ) -> List[torch.Tensor]:
     """Get model's prediction.
@@ -117,6 +116,7 @@ def get_models_predictions(
     :param model_type: default "seq2seq" for BCE model, "klcpd" for KLCPD model
     :param device: device name
     :param scales: scale parameter for KL-CPD predictions
+    :param q: probability for quantile-based predictions of the EnsembleCPDModel, set to 'None' is no ensemble is used
     :return: model's predictions
     """
     inputs = inputs.to(device)
@@ -159,12 +159,12 @@ def get_models_predictions(
     elif model_type == 'kl_cpd':
         outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
         uncertainties = None
+        
     elif model_type == "ensemble":
         # take mean values and std (as uncertainty measure)
         outs, uncertainties = model.predict(inputs)
     elif model_type == "ensemble_quantile":
-        outs = model.get_quantile_predictions(inputs, q)
-        uncertainties = None
+        outs, uncertainties = model.get_quantile_predictions(inputs, q)
     elif model_type == "cusum_aggr":
         outs = model.predict(inputs)
         uncertainties = None 
@@ -183,7 +183,6 @@ def evaluate_metrics_on_set(
     subseq_len: int = None, 
     device: str = 'cuda',
     scale: int = None,
-    
     uncert_th: float = None,
     q: float = None
     
@@ -198,6 +197,8 @@ def evaluate_metrics_on_set(
     :param subseq_len: length of a subsequence (for 'weak_labels' baseline)
     :param device: 'cuda' or 'cpu'
     :param scale: scale factor (for KL-CPD and TSCP models)
+    :param uncert_th: std threshold for CPD-with-rejection, set to 'None' if not rejection is needed
+    :param q: probability for quantile-based predictions of the EnsembleCPDModel, set to 'None' is no ensemble is used
     :return: tuple of
         - TN, FP, FN, TP
         - mean time to a false alarm
@@ -385,7 +386,6 @@ def evaluation_pipeline(
     model_type: str = 'seq2seq',
     subseq_len: int = None,
     scale: int = None,
-
     uncert_th: float = None,
     q: float = None
     
@@ -400,6 +400,8 @@ def evaluation_pipeline(
     :param model_type: type of the model ('seq2seq', 'kl_cpd', 'tscp', baselines)
     :param subseq_len: subsequence length (for 'weak_labels' baseline)
     :param scale: scale factor (for KL-CPD and TSCP models)
+    :param uncert_th: std threshold for CPD-with-rejection, set to 'None' if not rejection is needed
+    :param q: probability for quantile-based predictions of the EnsembleCPDModel, set to 'None' is no ensemble is used
     :return: tuple of
         - threshold th_1 corresponding to the maximum F1-score
         - mean time to a False Alarm corresponding to th_1

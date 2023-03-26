@@ -57,7 +57,6 @@ class EnsembleCPDModel(ABC):
         self.boot_sample_size = boot_sample_size
         
         self.fitted = False
-
         self.initialize_models_list()
 
     def eval(self) -> None:
@@ -81,7 +80,6 @@ class EnsembleCPDModel(ABC):
             for _ in range(self.n_models):
                 
                 # sample with replacement
-                #idxs = np.random.choice(range(len(self.train_dataset)), size=self.boot_sample_size)
                 idxs = torch.randint(len(self.train_dataset), size=(self.boot_sample_size, ))
                 curr_train_data = Subset(self.train_dataset, idxs)
                 self.train_datasets_list.append(curr_train_data)
@@ -107,9 +105,7 @@ class EnsembleCPDModel(ABC):
                 print(f'\nFitting model number {i+1}.')
                 trainer = pl.Trainer(
                     max_epochs=self.args["learning"]["epochs"],
-                    accelerator=self.args["learning"]["accelerator"],
-                    devices=self.args["learning"]["devices"],
-                    #gpus=self.args["learning"]["gpus"],
+                    gpus=self.args["learning"]["gpus"],
                     benchmark=True,
                     check_val_every_n_epoch=1,
                     callbacks=EarlyStopping(monitor="val_loss", min_delta=0, patience=10)
@@ -205,7 +201,7 @@ class CusumEnsembleCPDModel(EnsembleCPDModel):
         args: dict,
         n_models: int,
         boot_sample_size: int = None,
-        scale_by_std: float = 0,
+        scale_by_std: bool = True,
         cusum_threshold: float = 0.1,
         seed: int = 0
     ) -> None:
@@ -237,7 +233,7 @@ class CusumEnsembleCPDModel(EnsembleCPDModel):
         :returns: change_mask 
         """
         normal_to_change_stat = torch.zeros(len(series_mean)).to(series_mean.device)
-        change_to_normal_stat = torch.zeros(len(series_mean)).to(series_mean.device)
+        #change_to_normal_stat = torch.zeros(len(series_mean)).to(series_mean.device)
         change_mask = torch.zeros(len(series_mean)).to(series_mean.device)
 
         for i in range(1, len(series_mean)):
