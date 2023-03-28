@@ -18,4 +18,4 @@ One can find the list or the necessary packages in the ```requirements.txt``` fi
 
 In order to reproduce our experiments, please look at the ```CPD_Ensembles.ipynb``` notebook which runs all the main experiments on the dataset of sequences of MNIST images. Note that they can be run for any other dataset or base model available in this pipeline. For instructions, please, go to this notebook.
 
-The file ```UE for CPD.pdf``` contains the presentation of our project.
+The file ```UE for CPD.pdf``` contains the presentation of our project. The file ```UE_for_CPD_report.pdf``` contains the full report.
