@@ -6,7 +6,7 @@ import os
 import pickle
 import random
 
-import av
+#import av
 import numpy as np
 import pandas as pd
 import torch
@@ -27,10 +27,16 @@ from torchvision.transforms._transforms_video import (
 )
 from tqdm import tqdm
 
+
 class CPDDatasets:
     """Class for experiments' datasets."""
 
-    def __init__(self, experiments_name: str, random_seed: int = 123) -> None:
+    def __init__(
+        self,
+        experiments_name: str,
+        random_seed: int = 123,
+        train_anomaly_num: int = None,
+    ) -> None:
         """Initialize dataset class.
 
         :param experiments_name: type of experiments
@@ -44,12 +50,13 @@ class CPDDatasets:
         """
         super().__init__()
         self.random_seed = random_seed
+        self.train_anomaly_num = train_anomaly_num
 
         if experiments_name in [
             "human_activity",
             "mnist",
             "explosion",
-            "road_accidents",
+            "road_accidents"
         ]:
             self.experiments_name = experiments_name
         elif experiments_name.startswith("synthetic"):
@@ -67,7 +74,7 @@ class CPDDatasets:
         train_dataset = None
         test_dataset = None
         if self.experiments_name == "mnist":
-            path_to_data = "data/mnist/"
+            path_to_data = "../../data/mnist/"
             dataset = MNISTSequenceDataset(path_to_data=path_to_data, type_seq="all")
             train_dataset, test_dataset = self.train_test_split_(
                 dataset, test_size=0.3, shuffle=True
@@ -82,7 +89,7 @@ class CPDDatasets:
             )
 
         elif self.experiments_name == "human_activity":
-            path_to_data = "data/human_activity/"
+            path_to_data = "../../data/human_activity/"
             train_dataset = HumanActivityDataset(
                 path_to_data=path_to_data, seq_len=20, train_flag=True
             )
@@ -91,14 +98,13 @@ class CPDDatasets:
             )
 
         elif self.experiments_name in ["explosion", "road_accidents"]:
-
             # default initialization for explosion
-            path_to_data = "data/explosion/"
+            path_to_data = "../../data/explosion/"
             path_to_train_annotation = path_to_data + "UCF_train_time_markup.txt"
             path_to_test_annotation = path_to_data + "UCF_test_time_markup.txt"
 
             if self.experiments_name == "road_accidents":
-                path_to_data = "data/road_accidents/"
+                path_to_data = "../../data/road_accidents/"
                 path_to_train_annotation = (
                     path_to_data + "UCF_road_train_time_markup.txt"
                 )
@@ -129,7 +135,10 @@ class CPDDatasets:
                 num_workers=0,
                 fps=30,
                 sampler="equal",
+                #sampler="downsample_anomaly",
+                #train_anomaly_num=self.train_anomaly_num,
             )
+
             test_dataset = UCFVideoDataset(
                 clip_length_in_frames=16,
                 step_between_clips=16,
@@ -140,6 +149,7 @@ class CPDDatasets:
                 fps=30,
                 sampler="downsample_norm",
             )
+            
         return train_dataset, test_dataset
 
     def train_test_split_(
@@ -454,7 +464,6 @@ class HumanActivityDataset(Dataset):
         labels = []
 
         for sub in self.data["subject"].unique():
-
             tmp = self.data[self.data.subject == sub]
             # labels 7 - 12 characterize the change points
             tmp_change_only = tmp[tmp.labels.isin([7, 8, 9, 10, 11, 12])]
@@ -549,6 +558,7 @@ class UCFVideoDataset(Dataset):
         num_workers: int = 0,
         fps: int = 30,
         sampler: str = "all",
+        train_anomaly_num: int = None,
     ) -> None:
         """Initialize UCF video dataset.
 
@@ -620,10 +630,18 @@ class UCFVideoDataset(Dataset):
 
         if sampler == "equal":
             self.video_clips.valid_idxs = self._equal_sampling()
+
+        elif sampler == "downsample_anomaly" and train_anomaly_num is not None:
+            self.video_clips.valid_idxs = self._equal_sampling(
+                downsample_anomaly=train_anomaly_num
+            )
+
         elif sampler == "downsample_norm":
             self.video_clips.valid_idxs = self._equal_sampling(downsample_normal=300)
+
         elif sampler == "all":
             pass
+
         else:
             raise ValueError("Wrong type of sampling")
 
@@ -764,7 +782,9 @@ class UCFVideoDataset(Dataset):
                 dict_types[video_name].append(video_type)
         return dict_metadata, dict_types
 
-    def _equal_sampling(self, downsample_normal=None) -> List[int]:
+    def _equal_sampling(
+        self, downsample_normal=None, downsample_anomaly=None
+    ) -> List[int]:
         """Balance sets with and without changes.
 
         The equal number of clips are sampled from each video (if possible).
@@ -803,6 +823,8 @@ class UCFVideoDataset(Dataset):
             idxs_for_sampling: np.array, max_size: int, random_seed: int = 123
         ):
             """Random sampling  of clips."""
+            assert len(idxs_for_sampling) >= max_size, "Trying to sample too many clips"
+
             fix_seeds(random_seed)
             _sample_idxs = random.choices(idxs_for_sampling, k=max_size)
             return _sample_idxs
@@ -820,6 +842,7 @@ class UCFVideoDataset(Dataset):
         cp_idxs, normal_idxs, normal_cp_idxs = _get_indexes(
             self.video_clips.normal_idxs, self.video_clips.cp_idxs
         )
+
         cp_number = len(cp_idxs)
 
         if downsample_normal is not None:
@@ -862,5 +885,10 @@ class UCFVideoDataset(Dataset):
             )
         else:
             extra = []
+
+        # controlling number of anomaly clips
+        if downsample_anomaly is not None:
+            cp_idxs = _random_sampling(cp_idxs, max_size=downsample_anomaly)
+
         sample_idxs = cp_idxs + normal_from_cp + normal + extra
         return sample_idxs

@@ -60,8 +60,9 @@ def get_seq2seq_models_list(
             input_size=args["model"]["input_size"],
             hidden_dim=args["model"]["hidden_dim"],
             n_layers=args["model"]["n_layers"],
-            drop_prob=args["model"]["drop_prob"]
-            )
+            drop_prob=args["model"]["drop_prob"],
+            layer_norm=args["model"]["layer_norm"]
+        )
             
     elif args["experiments_name"] == "mnist":        
         # initialize default base model for MNIST experiment
@@ -81,9 +82,9 @@ def get_seq2seq_models_list(
             rnn_hidden_dim=args["model"]["hidden_rnn"],
             num_layers=args["model"]["rnn_n_layers"],
             rnn_dropout=args["model"]["rnn_dropout"],
-            dropout=args["model"]["dropout"]
+            dropout=args["model"]["dropout"],
+            layer_norm=args["model"]["layer_norm"]
         )
-
     else:
         raise ValueError("Wrong experiment name.")
 
@@ -149,8 +150,8 @@ def get_kl_cpd_models_list(
         test_dataset=test_dataset
         )
     models_list = [model]
-    print(model)
     return models_list
+
 
 def get_tscp_models_list(
     args: dict,
@@ -183,6 +184,7 @@ def get_classic_models_list(args: dict) -> List[cpd_models.ClassicBaseline]:
     :param args: dict with all the parameters
     :return: ClassicBaseline model
     """
+    
     if (args["n_pred"] is None and args["pen"] is None) \
             or (args["n_pred"] is not None and args["pen"] is not None):
             
@@ -201,6 +203,7 @@ def get_classic_models_list(args: dict) -> List[cpd_models.ClassicBaseline]:
         raise ValueError(f'Wrong classic baseline type: {args["model_type"]}.')
     
     # for consistency with the general interface
+    model = None
     models_list = [model]
     
     return models_list

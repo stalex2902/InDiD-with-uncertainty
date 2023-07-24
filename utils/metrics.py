@@ -36,8 +36,8 @@ def calculate_errors(
 ) -> Tuple[int, int, int, int, List[float], List[float]]:
     """Calculate confusion matrix, detection delay and time to false alarms.
 
-    :param real: real labels of change points
-    :param pred: predicted labels (0 or 1) of change points
+    :param real: real true change points idxs for a batch
+    :param pred: predicted change point idxs for a batch
     :param seq_len: length of sequence
     :return: tuple of
         - TN, FP, FN, TP
@@ -72,9 +72,49 @@ def calculate_errors(
     
     return TN, FP, FN, TP, FP_delay, delay
 
+def calculate_conf_matrix_margin(
+    real: torch.Tensor,
+    pred: torch.Tensor,
+    margin: int
+) -> Tuple[int, int, int, int, List[float], List[float]]:
+    """Calculate confusion matrix, detection delay and time to false alarms.
+
+    :param real: real labels of change points
+    :param pred: predicted labels (0 or 1) of change points
+    :param margin: if |true_cp_idx - pred_cp_idx| <= margin, report TP
+    :return: tuple of (TN, FP, FN, TP)
+    """  
+    tn_mask_margin = torch.logical_and(real == pred, real == -1)
+    fn_mask_margin = torch.logical_and(real != pred, pred == -1)
+
+    tp_mask_margin = torch.logical_and(
+        torch.logical_and(torch.abs(real - pred) <= margin, real != -1), pred != -1
+    )
+
+    fp_mask_margin = torch.logical_or(
+        torch.logical_and(torch.logical_and(torch.abs(real - pred) > margin, real != -1), pred != -1),
+        torch.logical_and(pred != -1, real == -1)
+    )
+
+    TN_margin = tn_mask_margin.sum().item()
+    FN_margin = fn_mask_margin.sum().item()
+    TP_margin = tp_mask_margin.sum().item()
+    FP_margin = fp_mask_margin.sum().item()
+
+    #print("real:", real)
+    #print("pred:", pred)
+    #print("Confusion:", TN_margin, FN_margin, TP_margin, FP_margin)
+    #print("Total num:", len(real))
+    #print("ok")
+
+    assert((TN_margin + TP_margin + FN_margin + FP_margin) == len(real)), "Check TP, TN, FP, FN cases."    
+    
+    return TN_margin, FP_margin, FN_margin, TP_margin
+
 def calculate_metrics(
     true_labels: torch.Tensor,
-    predictions: torch.Tensor
+    predictions: torch.Tensor,
+    margin: int = None
 ) -> Tuple[int, int, int, int, np.array, np.array, int]:
     """Calculate confusion matrix, detection delay, time to false alarms, covering.
 
@@ -95,8 +135,16 @@ def calculate_metrics(
     
     TN, FP, FN, TP, FP_delay, delay = calculate_errors(real_change_ind, predicted_change_ind, seq_len)
     cover = calculate_cover(real_change_ind, predicted_change_ind, seq_len)
+
+    TN_margin, FP_margin, FN_margin, TP_margin = None, None, None, None
+    
+    # add margin metrics
+    if margin is not None:
+        TN_margin, FP_margin, FN_margin, TP_margin = calculate_conf_matrix_margin(
+            real_change_ind, predicted_change_ind, margin
+        )
         
-    return TN, FP, FN, TP, FP_delay, delay, cover
+    return (TN, FP, FN, TP, FP_delay, delay, cover), (TN_margin, FP_margin, FN_margin, TP_margin)
 
 def get_models_predictions(
     inputs: torch.Tensor,
@@ -119,7 +167,11 @@ def get_models_predictions(
     :param q: probability for quantile-based predictions of the EnsembleCPDModel, set to 'None' is no ensemble is used
     :return: model's predictions
     """
-    inputs = inputs.to(device)
+    try:
+        inputs = inputs.to(device)
+    except:
+        inputs = [t.to(device) for t in inputs]
+        
     true_labels = labels.to(device)
 
     if model_type in ['simple', 'weak_labels']:
@@ -154,23 +206,48 @@ def get_models_predictions(
         uncertainties = None
         
     elif model_type == 'tscp':
-        outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+        #outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
+        outs = tscp.get_tscp_output_scaled_padded(model, inputs, model.window_1, model.window_2, scale=scale)
         uncertainties = None
+
     elif model_type == 'kl_cpd':
         outs = klcpd.get_klcpd_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
         uncertainties = None
         
     elif model_type == "ensemble":
         # take mean values and std (as uncertainty measure)
-        outs, uncertainties = model.predict(inputs)
+        outs, uncertainties = model.predict(inputs, scale=scale)
+
     elif model_type == "ensemble_quantile":
         outs, uncertainties = model.get_quantile_predictions(inputs, q)
+
+    elif model_type == "ensemble_max":
+        outs, uncertainties = model.get_max_predictions(inputs)
+    
+    elif model_type == "ensemble_min":
+        outs, uncertainties = model.get_min_predictions(inputs)
+
     elif model_type == "cusum_aggr":
-        outs = model.predict(inputs)
-        uncertainties = None 
-    else:
+        outs = model.predict(inputs, scale=scale)
+        uncertainties = None
+    
+    elif model_type == "cusum_traject":
+        outs = model.predict_cusum_trajectories(inputs, q)
+        uncertainties = None
+
+    elif model_type == "seq2seq":
         outs = model(inputs)
         uncertainties = None
+    
+    elif model_type == "fake_ensemble":
+        outs, uncertainties = inputs
+    
+    elif model_type == "fake_cusum":
+        outs = model.fake_predict(*inputs)
+        uncertainties = None
+        
+    else:
+        raise ValueError(f'Wrong model type {model_type}.')
         
     return outs, uncertainties, true_labels
 
@@ -184,7 +261,8 @@ def evaluate_metrics_on_set(
     device: str = 'cuda',
     scale: int = None,
     uncert_th: float = None,
-    q: float = None
+    q: float = None,
+    margin: int = None
     
 ) -> Tuple[int, int, int, int, float, float]:
     """Calculate metrics for CPD.
@@ -205,19 +283,22 @@ def evaluate_metrics_on_set(
         - mean detection delay
         - mean covering
     """
-    model.eval()
-    model.to(device)    
+    if model is not None:
+        model.eval()
+        model.to(device)    
     
     FP_delays = []
     delays = []
     covers = []
     TN, FP, FN, TP = (0, 0, 0, 0)
+    TN_margin, FP_margin, FN_margin, TP_margin = (0, 0, 0, 0)
     
     with torch.no_grad():
             
-        for test_inputs, test_labels in test_loader:
+        for *test_inputs, test_labels in test_loader:
             test_out, test_uncertainties, test_labels = get_models_predictions(
-                test_inputs, test_labels,
+                test_inputs,
+                test_labels,
                 model,
                 model_type=model_type,
                 subseq_len=subseq_len,
@@ -239,11 +320,15 @@ def evaluate_metrics_on_set(
             
             if test_uncertainties is not None and uncert_th is not None:
                 cropped_outs = (test_out > threshold) & (test_uncertainties < uncert_th)
+                
             else:
                 cropped_outs = test_out > threshold
-            
-            tn, fp, fn, tp, FP_delay, delay, cover = calculate_metrics(
-                test_labels, cropped_outs
+                            
+            (
+                (tn, fp, fn, tp, FP_delay, delay, cover),
+                (tn_margin, fp_margin, fn_margin, tp_margin)
+            ) = calculate_metrics(
+                test_labels, cropped_outs, margin
             )     
 
             del test_labels
@@ -256,6 +341,13 @@ def evaluate_metrics_on_set(
             FP += fp
             FN += fn
             TP += tp
+
+            if margin is not None:
+                TN_margin += tn_margin
+                FP_margin += fp_margin
+                FN_margin += fn_margin
+                TP_margin += tp_margin
+
             
             FP_delays.append(FP_delay.detach().cpu())
             delays.append(delay.detach().cpu())
@@ -283,7 +375,7 @@ def evaluate_metrics_on_set(
     if 'cuda' in device:
         torch.cuda.empty_cache()         
 
-    return TN, FP, FN, TP, mean_delay, mean_FP_delay, mean_cover
+    return (TN, FP, FN, TP, mean_delay, mean_FP_delay, mean_cover), (TN_margin, FP_margin, FN_margin, TP_margin)
 
 
 def area_under_graph(delay_list: List[float], fp_delay_list: List[float]) -> float:
@@ -387,7 +479,8 @@ def evaluation_pipeline(
     subseq_len: int = None,
     scale: int = None,
     uncert_th: float = None,
-    q: float = None
+    q: float = None,
+    margin: int = None
     
 ) -> Tuple[Tuple[float], dict, dict]:
     """Evaluate trained CPD model.
@@ -420,7 +513,9 @@ def evaluation_pipeline(
     
     cover_dict = {}
     f1_dict = {}
-    f1_lib_dict = {}
+
+    if margin is not None:
+        f1_margin_dict = {}
     
     delay_dict = {}
     fp_delay_dict = {}
@@ -433,13 +528,12 @@ def evaluation_pipeline(
 
     for threshold in tqdm(threshold_list):
         (
-            TN,
-            FP,
-            FN,
-            TP,
-            mean_delay,
-            mean_fp_delay,
-            cover
+            (
+                TN, FP, FN, TP, mean_delay, mean_fp_delay, cover
+            ),
+            (
+                TN_margin, FP_margin, FN_margin, TP_margin 
+            )
         ) = evaluate_metrics_on_set(
             model=model,
             test_loader=test_dataloader,
@@ -450,7 +544,8 @@ def evaluation_pipeline(
             device=device,
             scale=scale,
             uncert_th=uncert_th,
-            q=q
+            q=q,
+            margin=margin
             )
 
         confusion_matrix_dict[threshold] = (TN, FP, FN, TP)
@@ -459,6 +554,9 @@ def evaluation_pipeline(
         
         cover_dict[threshold] = cover
         f1_dict[threshold] = F1_score((TN, FP, FN, TP))
+
+        if margin is not None:
+           f1_margin_dict[threshold] = F1_score((TN_margin, FP_margin, FN_margin, TP_margin)) 
 
     if model_type == "cusum_aggr":
         auc = None
@@ -477,6 +575,13 @@ def evaluation_pipeline(
     
     best_th_cover = max(cover_dict, key=cover_dict.get)
     max_cover = cover_dict[best_th_cover]
+
+    if margin is not None:
+        best_th_f1_margin = max(f1_margin_dict, key=f1_margin_dict.get)
+        max_f1_margin = f1_margin_dict[best_th_f1_margin]
+    else:
+       best_th_f1_margin = None
+       max_f1_margin = None 
     
     # Time to FA, detection delay
     best_time_to_FA = fp_delay_dict[best_th_f1]
@@ -498,10 +603,14 @@ def evaluation_pipeline(
 
         print('Max COVER {}: for threshold {}'.format(round(cover_dict[max(cover_dict, key=cover_dict.get)], 4), 
                                                       round(max(cover_dict, key=cover_dict.get), 4)))
-
+        if margin is not None:
+            print('Max F1 with margin {}: {} for best threshold {}'.format(
+                margin, round(max_f1_margin, 4), round(best_th_f1_margin, 4)
+                )
+            )
         
     return (best_th_f1, best_time_to_FA, best_delay, auc, best_conf_matrix, best_f1, best_cover, 
-                                            best_th_cover, max_cover), delay_dict, fp_delay_dict
+            best_th_cover, max_cover), (best_th_f1_margin, max_f1_margin), delay_dict, fp_delay_dict
 
 
 #------------------------------------------------------------------------------------------------------------#
@@ -558,7 +667,7 @@ def classic_baseline_metrics(
     delays = []
     covers = []
     TN, FP, FN, TP = (0, 0, 0, 0)
-    TN, FP, FN, TP, FP_delay, delay, cover = calculate_metrics(all_labels, all_preds > threshold)     
+    TN, FP, FN, TP, FP_delay, delay, cover = calculate_metrics(all_labels, all_preds > threshold) 
     f1 = F1_score((TN, FP, FN, TP))
     FP_delay = torch.mean(FP_delay.float()).item()
     delay = torch.mean(delay.float()).item()
@@ -606,7 +715,15 @@ def write_metrics_to_file(
     :param timestamp: timestamp indicating which model was evaluated
     :param comment: any additional information about the experiment
     """
-    best_th_f1, best_time_to_FA, best_delay, auc, best_conf_matrix, best_f1, best_cover, best_th_cover, max_cover = metrics
+    (
+        (
+            best_th_f1, best_time_to_FA, best_delay, auc, best_conf_matrix,
+            best_f1, best_cover, best_th_cover, max_cover
+        ),
+        (
+            best_th_f1_margin, max_f1_margin
+        )
+    ) = metrics
     
     with open(filename, 'a') as f:
         f.writelines('Comment: {}\n'.format(comment))
@@ -625,6 +742,8 @@ def write_metrics_to_file(
         f.writelines('COVER {}: for best-F1 threshold {}\n'.format(round(best_cover, 4), round(best_th_f1, 4)))
 
         f.writelines('Max COVER {}: for threshold {}\n'.format(max_cover, best_th_cover))
+        if max_f1_margin is not None:
+            f.writelines('Max F1 with margin: {} for threshold {}\n'.format(max_f1_margin, best_th_f1_margin))
         f.writelines('----------------------------------------------------------------------\n')
 
 def dump_results(metrics_local: tuple, pickle_name: str) -> None:
@@ -644,3 +763,169 @@ def dump_results(metrics_local: tuple, pickle_name: str) -> None:
 
     with Path(pickle_name).open("wb") as f:
         pickle.dump(results, f)
+
+#------------------------------------------------------------------------------------------------------------#
+#                                          Rejection metrics                                                 #
+#------------------------------------------------------------------------------------------------------------#
+
+def compute_binary_confusion_matrix(test_labels_batch, predictions_batch):
+    TP = ((test_labels_batch == 1) & (predictions_batch == 1)).astype(int).sum()#.sum(axis=1)
+    FN = ((test_labels_batch == 1) & (predictions_batch == 0)).astype(int).sum()#.sum(axis=1)
+    FP = ((test_labels_batch == 0) & (predictions_batch == 1)).astype(int).sum()#.sum(axis=1)
+    TN = ((test_labels_batch == 0) & (predictions_batch == 0)).astype(int).sum()#.sum(axis=1)
+    return TP, FN, FP, TN
+
+def evaluate_rejection_metrics_on_set(
+    model: nn.Module,
+    test_loader: DataLoader,
+    threshold: float = 0.5,
+    model_type: str = 'seq2seq',
+    subseq_len: int = None, 
+    device: str = 'cuda',
+    scale: int = None,
+    reject_uncert_th: float = np.inf,
+    q: float = None
+) -> Tuple[float, float]:
+    
+    model.eval()
+    model.to(device)
+    
+    TP_global = 0
+    FN_global = 0
+    FP_global = 0
+    TN_global = 0
+    
+    with torch.no_grad():
+            
+        for test_inputs, test_labels in test_loader:
+            test_out, test_uncertainties, test_labels = get_models_predictions(
+                test_inputs, test_labels,
+                model,
+                model_type=model_type,
+                subseq_len=subseq_len,
+                device=device,
+                scale=scale,
+                q=q
+            )
+
+            try:
+                test_out = test_out.squeeze(2)
+                test_uncertainties = test_uncertainties.squeeze(2)
+            except:
+                try:
+                    test_out = test_out.squeeze(1)
+                    test_uncertainties = test_uncertainties.squeeze(1)
+                except:
+                    test_out = test_out
+                    test_uncertainties = test_uncertainties
+            
+            cropped_outs = (test_out > threshold).to(int)
+            
+            # rejection class label = 2
+            cropped_outs[test_uncertainties > reject_uncert_th] = 2
+            test_labels[test_uncertainties > reject_uncert_th] = 2
+            
+            TP, FN, FP, TN = compute_binary_confusion_matrix(test_labels.cpu().numpy(), cropped_outs.cpu().numpy())
+            
+            TP_global += TP
+            FN_global += FN
+            FP_global += FP
+            TN_global += TN
+            
+            del test_labels
+            del test_out            
+    
+    gc.collect()
+    if 'cuda' in device:
+        torch.cuda.empty_cache()
+    
+    EPS = 1e-9
+    f1_score_global = 2.0 * TP_global / (2 * TP_global + FN_global + FP_global + EPS)
+    accuracy_global = (TP_global + TN_global) / (TP_global + FN_global + FP_global + TN_global + EPS)
+    
+    return f1_score_global, accuracy_global
+
+
+def calculate_rejection_curves(
+    model: nn.Module,
+    test_loader: DataLoader,
+    # reject_uncert_th_list: List[float],
+    rates_num: int,
+    threshold: float = 0.5,
+    model_type: str = 'seq2seq',
+    subseq_len: int = None, 
+    device: str = 'cuda',
+    scale: int = None,
+    q: float = None
+) -> Tuple[dict, dict]:
+        
+    f1_scores_dict = dict()
+    acc_scores_dict = dict()
+    
+    reject_uncert_th_dict = evaluate_rej_rates_for_dataloader(
+        model, test_loader, rates_num, model_type, subseq_len, device, scale, q
+    )
+        
+    for rate, reject_uncert_th in tqdm(reject_uncert_th_dict.items()):
+        
+        mean_f1_score, mean_acc_score = evaluate_rejection_metrics_on_set(
+            model=model,
+            test_loader=test_loader,
+            threshold=threshold,
+            model_type=model_type,
+            subseq_len=subseq_len, 
+            device=device,
+            scale=scale,
+            reject_uncert_th=reject_uncert_th,
+            q=q
+        )
+        
+        f1_scores_dict[rate] = mean_f1_score
+        acc_scores_dict[rate] = mean_acc_score
+
+    return f1_scores_dict, acc_scores_dict
+
+def evaluate_rej_rates_for_dataloader(
+    model,
+    dataloader,
+    rates_num: int,
+    model_type: str = 'seq2seq',
+    subseq_len: int = None, 
+    device: str = 'cuda',
+    scale: int = None,
+    q: float = None
+):
+    model.eval()
+    model.to(device)
+    
+    all_uncerts = []
+    
+    with torch.no_grad():
+        for test_inputs, test_labels in dataloader:
+            test_out, test_uncertainties, test_labels = get_models_predictions(
+                test_inputs, test_labels,
+                model,
+                model_type=model_type,
+                subseq_len=subseq_len,
+                device=device,
+                scale=scale,
+                q=q
+            )
+            try:
+                test_out = test_out.squeeze(2)
+                test_uncertainties = test_uncertainties.squeeze(2)
+            except:
+                try:
+                    test_out = test_out.squeeze(1)
+                    test_uncertainties = test_uncertainties.squeeze(1)
+                except:
+                    test_out = test_out
+                    test_uncertainties = test_uncertainties
+                    
+            all_uncerts.append(test_uncertainties)
+            
+    all_uncerts = torch.cat(all_uncerts)
+    rej_rates = torch.linspace(0, 1, rates_num).to(device)
+    rej_thresholds_dict = {rate: torch.quantile(all_uncerts, 1 - rate) for rate in rej_rates}
+        
+    return rej_thresholds_dict

@@ -103,7 +103,6 @@ def history_future_separation(
         
     return history, future
 
-
 def history_future_separation_test(
     data: torch.Tensor,
     window_1: int,
@@ -190,6 +189,68 @@ def get_tscp_output_scaled(
     pred_out = torch.sigmoid(-pred_out * scale)
     return pred_out
 
+
+def get_tscp_output_scaled_padded(
+    tscp_model: nn.Module,
+    batch: torch.Tensor,
+    window_1: int,
+    window_2: Optional[int] = None,
+    scale: float = 1.
+) -> List[torch.Tensor]:
+    """Get TS-CP2 predictions scaled to [0, 1].
+
+    :param tscp_model: pre-trained TS-CP2 model
+    :param batch: input data
+    :param window_1: "past" subsequence size
+    :param window_2: "future" subsequence size (default None), if None set equal to window_1
+    :param scales: scale factor
+    :return: predicted change probability
+    """
+    device = tscp_model.device
+    batch = batch.to(device)
+    batch_size = batch.shape[0]
+        
+    # for 'synthetic1D', 'synthetic100D' and 'human_activity' datasets
+    if len(batch.shape) == 3:
+        seq_len = batch.shape[1]
+        prepend = batch[:, 0, :].unsqueeze(dim=1).repeat(1, window_1, 1)
+        append = batch[:, -1, :].unsqueeze(dim=1).repeat(1, window_2 - 1, 1)
+        batch = torch.hstack((prepend, batch, append))
+    
+    # for 'mnist' dataset
+    elif len(batch.shape) == 4:
+        seq_len = batch.shape[1]
+        prepend = batch[:, 0, :, :].unsqueeze(dim=1).repeat(1, window_1, 1, 1)
+        append = batch[:, -1, :, :].unsqueeze(dim=1).repeat(1, window_2 - 1, 1, 1)
+        batch = torch.hstack((prepend, batch, append))
+
+    # for video datasets 
+    else:
+        seq_len = batch.shape[2]
+
+        prepend = batch[:, :, 0, :, :].unsqueeze(dim=1).repeat(1, 1, window_1, 1, 1)
+        append = batch[:, :, -1, :, :].unsqueeze(dim=1).repeat(1, 1, window_2 - 1, 1, 1)
+        batch = torch.dstack((prepend, batch, append))    
+
+    batch_history_slices, batch_future_slices = history_future_separation_test(
+        batch, window_1, window_2
+    )    
+
+    pred_out = []
+    for i in range(len(batch_history_slices)):
+        curr_history = tscp_model(batch_history_slices[i]) 
+        curr_future = tscp_model(batch_future_slices[i]) 
+        rep_sim = _cosine_simililarity_dim1(curr_history, curr_future).data.unsqueeze(dim=0)
+        pred_out.append(rep_sim)
+        
+    pred_out = torch.cat(pred_out).to(batch.device)
+    pred_out = torch.sigmoid(-pred_out * scale)
+    min_batch = torch.sigmoid(-1 * torch.ones(batch_size, seq_len))
+    max_batch = torch.sigmoid(torch.ones(batch_size, seq_len))
+    pred_out = (pred_out - min_batch) / (max_batch - min_batch) 
+
+    return pred_out
+
 # --------------------------------------------------------------------------------------#
 #                                      Models                                           #
 # --------------------------------------------------------------------------------------#
@@ -253,7 +314,9 @@ class ResidualBlock(nn.Module):
         self.relu_2 = nn.ReLU()        
         
         self.conv_block = nn.Sequential()
-        self.downsample = nn.Conv1d(in_channels, self.nb_filters, kernel_size=1) if in_channels != self.nb_filters else nn.Identity()
+        self.downsample = nn.Conv1d(
+            in_channels, self.nb_filters, kernel_size=1
+        ) if in_channels != self.nb_filters else nn.Identity()
         
         self.relu = nn.ReLU()  
                 
@@ -323,7 +386,7 @@ class TCN(nn.Module):
         use_skip_connections: bool,
         dropout_rate: float, 
         use_batch_norm: bool,
-        use_layer_norm: bool, 
+        use_layer_norm: bool,
         use_weight_norm: bool
     ) -> None:
         """Initialize TCN model.
@@ -400,6 +463,9 @@ class BaseTSCPEncoder(nn.Module):
         super().__init__()
 
         self.c_in = args["model"]["c_in"]
+        
+        #print("c_in:", self.c_in)
+        
         self.nb_filters = args["model"]["nb_filters"]
         self.kernel_size = args["model"]["kernel_size"]
         self.nb_stacks = args["model"]["nb_stacks"]
@@ -428,7 +494,7 @@ class BaseTSCPEncoder(nn.Module):
 
         self.fc1 = nn.Linear(self.nb_filters * self.seq_len, 2 * self.n_steps)
         self.fc2 = nn.Linear(2 * self.n_steps, self.n_steps)    
-        self.output_layer = nn.Linear(self.n_steps, self.code_size)           
+        self.output_layer = nn.Linear(self.n_steps, self.code_size)         
         self.relu = nn.ReLU()
                 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -442,8 +508,8 @@ class BaseTSCPEncoder(nn.Module):
         out = self.tcn_layer(out)
         out = out.flatten(1, 2)
         out = self.relu(self.fc1(out))
-        out = self.relu(self.fc2(out)) 
-        out = self.output_layer(out)        
+        out = self.relu(self.fc2(out))
+        out = self.output_layer(out)     
         return out
 
 class TSCP_model(pl.LightningModule):
@@ -478,7 +544,7 @@ class TSCP_model(pl.LightningModule):
                 param.requires_grad = False
 
         else:
-           self.extractor = None 
+            self.extractor = None 
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset

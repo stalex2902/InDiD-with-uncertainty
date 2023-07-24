@@ -1,5 +1,5 @@
 """Methods and modules for experiments with seq2seq modeld ('indid', 'bce' and 'combided')"""
-from . import datasets, loss
+from . import loss
 
 from typing import List, Optional
 

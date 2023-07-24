@@ -426,7 +426,7 @@ class KLCPD(pl.LightningModule):
             for param in self.extractor.parameters():
                 param.requires_grad = False
         else:
-           self.extractor = None 
+            self.extractor = None 
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
@@ -481,7 +481,7 @@ class KLCPD(pl.LightningModule):
         """Pass input through the discriminator network and compute MMD score.
 
         :param input_past: tensor with past slice (len is window_1)
-        :param inoput_future: tensor with future slice (len is window_2)
+        :param input_future: tensor with future slice (len is window_2)
         :return: predicted MMD scores
         """
         # prepare input
@@ -596,8 +596,13 @@ class KLCPD(pl.LightningModule):
                 self.sigma_var.to(self.device)
             )
             loss_disc = (-1) * loss_disc
+            
             self.log("tlD", loss_disc, prog_bar=True)
             self.log("train_mmd2_real_D", mmd2_real, prog_bar=True)
+            
+            #if batch_idx % 5 == 0:
+            #    print("mmd2_real:", mmd2_real)
+            #    print("loss_disc:", loss_disc)
 
             return loss_disc
 
@@ -614,6 +619,9 @@ class KLCPD(pl.LightningModule):
             )
             loss_gen = gen_mmd2.mean()
             self.log("tlG", loss_gen, prog_bar=True)
+            
+            #if batch_idx % 5 == 0:
+            #    print("loss_disc:", loss_gen)
 
             return loss_gen
 
