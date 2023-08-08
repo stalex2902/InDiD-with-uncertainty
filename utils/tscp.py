@@ -34,7 +34,7 @@ def _cosine_simililarity_dim2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # v shape: (N, 2N)
     cos = nn.CosineSimilarity(dim=2, eps=1e-6)
     v = cos(x.unsqueeze(1), y.unsqueeze(0))
-    return v    
+    return v 
 
 def nce_loss_fn(
     history: torch.Tensor,
@@ -147,13 +147,21 @@ def history_future_separation_test(
 # --------------------------------------------------------------------------------------#
 #                                   Predictions                                         #
 # --------------------------------------------------------------------------------------#
+def ema_batch(outputs, alpha):
+    assert alpha >= 0 and alpha <= 1, "Smoothing factor alpha should be in [0, 1]."
+    seq_len = outputs.shape[1]
+    ema_outputs = outputs.clone()
+    for t in range(1, seq_len):
+        ema_outputs[:, t] = alpha * outputs[:, t] + (1 - alpha) * ema_outputs[:, t - 1]
 
-def get_tscp_output_scaled(
+    return ema_outputs
+
+def get_tscp_output(
     tscp_model: nn.Module,
     batch: torch.Tensor,
     window_1: int,
     window_2: Optional[int] = None,
-    scale: float = 1.
+    step: int = 1,
 ) -> List[torch.Tensor]:
     """Get TS-CP2 predictions scaled to [0, 1].
 
@@ -161,7 +169,6 @@ def get_tscp_output_scaled(
     :param batch: input data
     :param window_1: "past" subsequence size
     :param window_2: "future" subsequence size (default None), if None set equal to window_1
-    :param scales: scale factor
     :return: predicted change probability
     """
     device = tscp_model.device
@@ -173,29 +180,31 @@ def get_tscp_output_scaled(
         seq_len = batch.shape[2]
 
     batch_history_slices, batch_future_slices = history_future_separation_test(
-        batch, window_1, window_2
+        batch, window_1, window_2, step=step
     )
     
     pred_out = []
-    for i in range(len(batch_history_slices)):
-        zeros = torch.ones(1, seq_len)
-        curr_history = tscp_model(batch_history_slices[i]) 
-        curr_future = tscp_model(batch_future_slices[i]) 
+    crop_size = seq_len - (window_1 + window_2 - 1)
+    for history_slice, future_slice in zip(batch_history_slices, batch_future_slices):
+        zeros = torch.ones(1, seq_len)        
+        curr_history, curr_future = map(tscp_model, [history_slice, future_slice])
         rep_sim = _cosine_simililarity_dim1(curr_history, curr_future).data
+        # duplicate similarities in case of step > 1, crop the remainder
+        rep_sim = torch.repeat_interleave(rep_sim, step, dim=0)[:crop_size]
         zeros[:, window_1 + window_2 - 1 :] = rep_sim
         pred_out.append(zeros)
         
     pred_out = torch.cat(pred_out).to(batch.device)
-    pred_out = torch.sigmoid(-pred_out * scale)
+
     return pred_out
 
 
-def get_tscp_output_scaled_padded(
+def get_tscp_output_padded(
     tscp_model: nn.Module,
     batch: torch.Tensor,
     window_1: int,
     window_2: Optional[int] = None,
-    scale: float = 1.
+    step: int = 1, 
 ) -> List[torch.Tensor]:
     """Get TS-CP2 predictions scaled to [0, 1].
 
@@ -208,48 +217,74 @@ def get_tscp_output_scaled_padded(
     """
     device = tscp_model.device
     batch = batch.to(device)
-    batch_size = batch.shape[0]
-        
-    # for 'synthetic1D', 'synthetic100D' and 'human_activity' datasets
+
+    # for 'synthetic1D', 'synthetic100D', 'human_activity' and "yahoo" datasets
     if len(batch.shape) == 3:
         seq_len = batch.shape[1]
-        prepend = batch[:, 0, :].unsqueeze(dim=1).repeat(1, window_1, 1)
-        append = batch[:, -1, :].unsqueeze(dim=1).repeat(1, window_2 - 1, 1)
+        prepend = batch[:, 0 : window_1, :]
+        append = batch[:, -window_2 : -1, :] #.unsqueeze(dim=1).repeat(1, window_2 - 1, 1)
         batch = torch.hstack((prepend, batch, append))
     
     # for 'mnist' dataset
-    elif len(batch.shape) == 4:
+    elif len(batch.shape) == 4: 
         seq_len = batch.shape[1]
-        prepend = batch[:, 0, :, :].unsqueeze(dim=1).repeat(1, window_1, 1, 1)
-        append = batch[:, -1, :, :].unsqueeze(dim=1).repeat(1, window_2 - 1, 1, 1)
+        prepend = batch[:, 0 : window_1, :, :]#.unsqueeze(dim=1).repeat(1, window_1, 1, 1)
+        append = batch[:, -window_2 : -1, :, :]#.unsqueeze(dim=1).repeat(1, window_2 - 1, 1, 1)
         batch = torch.hstack((prepend, batch, append))
 
     # for video datasets 
     else:
         seq_len = batch.shape[2]
-
-        prepend = batch[:, :, 0, :, :].unsqueeze(dim=1).repeat(1, 1, window_1, 1, 1)
-        append = batch[:, :, -1, :, :].unsqueeze(dim=1).repeat(1, 1, window_2 - 1, 1, 1)
-        batch = torch.dstack((prepend, batch, append))    
+        prepend = batch[:, :, 0 : window_1, :, :]#.unsqueeze(dim=2).repeat(1, 1, window_1, 1, 1)
+        append = batch[:, :, -window_2 : -1, :, :]#.unsqueeze(dim=2).repeat(1, 1, window_2 - 1, 1, 1)
+        batch = torch.dstack((prepend, batch, append))
 
     batch_history_slices, batch_future_slices = history_future_separation_test(
-        batch, window_1, window_2
-    )    
-
+        batch, window_1, window_2, step=step
+    )
     pred_out = []
-    for i in range(len(batch_history_slices)):
-        curr_history = tscp_model(batch_history_slices[i]) 
-        curr_future = tscp_model(batch_future_slices[i]) 
+    for history_slice, future_slice in zip(batch_history_slices, batch_future_slices):
+        curr_history, curr_future = map(tscp_model, [history_slice, future_slice])
         rep_sim = _cosine_simililarity_dim1(curr_history, curr_future).data.unsqueeze(dim=0)
+        # duplicate similarities in case of step > 1, crop the remainder
+        rep_sim = torch.repeat_interleave(rep_sim, step, dim=1)[:, :seq_len]
         pred_out.append(rep_sim)
         
     pred_out = torch.cat(pred_out).to(batch.device)
-    pred_out = torch.sigmoid(-pred_out * scale)
-    min_batch = torch.sigmoid(-1 * torch.ones(batch_size, seq_len))
-    max_batch = torch.sigmoid(torch.ones(batch_size, seq_len))
-    pred_out = (pred_out - min_batch) / (max_batch - min_batch) 
-
     return pred_out
+
+'''
+def post_process_tscp_output(outputs: torch.Tensor, scale: float = 1., alpha: float = 1.) -> torch.Tensor:
+    """
+    outputs = torch.sigmoid(-outputs * scale)
+    
+    min_score = torch.sigmoid(-1 * torch.ones_like(outputs))
+    max_score = torch.sigmoid(torch.ones_like(outputs))
+    
+    outputs = (outputs - min_score) / (max_score - min_score)
+
+    # default alpha = 1.0 means no EMA
+    """
+    seq_len = outputs.shape[1]
+
+    scaled_outputs = -scale * outputs
+    preds = torch.where(scaled_outputs >= 0, scaled_outputs, torch.zeros_like(scaled_outputs))
+
+    preds = ema_batch(preds, alpha)
+
+    #min_score = torch.min(preds, axis=1)[0].unsqueeze(dim=1).repeat(1, seq_len)
+    #max_score = torch.max(preds, axis=1)[0].unsqueeze(dim=1).repeat(1, seq_len)
+
+    #scaled_preds = (preds - min_score) / (max_score - min_score)
+
+    return preds
+'''
+
+def post_process_tscp_output(outputs: torch.Tensor, scale: float = 1., alpha: float = 1.) -> torch.Tensor:    
+    preds = 1. - torch.where(outputs >= 0, outputs, torch.zeros_like(outputs))
+    preds = ema_batch(preds, alpha)
+    return preds
+
 
 # --------------------------------------------------------------------------------------#
 #                                      Models                                           #
@@ -374,6 +409,7 @@ class ResidualBlock(nn.Module):
         skip_out = self.downsample(inp)
         res = self.relu(out + skip_out)
         return res, skip_out
+
     
 class TCN(nn.Module):  
     def __init__(
@@ -518,7 +554,9 @@ class TSCP_model(pl.LightningModule):
         args: dict,
         model: nn.Module,     
         train_dataset: Dataset, 
-        test_dataset: Dataset
+        test_dataset: Dataset,
+
+        dataloader_seed: int = 42 
     ) -> None:
         """Initialize TC-CP2 model (lightning wrapper).
 
@@ -562,6 +600,8 @@ class TSCP_model(pl.LightningModule):
         self.window_2 = args["model"]["window_2"]
 
         self.experiments_name = args["experiments_name"]
+
+        self.dataloader_seed = dataloader_seed
 
     def __preprocess(self, input: torch.Tensor) -> torch.Tensor:
         """Preprocess batch before forwarding (i.e. apply extractor for video input).
@@ -637,17 +677,20 @@ class TSCP_model(pl.LightningModule):
         """
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=opt, T_max=self.decay_steps)
-        return opt
+        return {"optimizer": opt, "lr_scheduler": lr}
 
     def train_dataloader(self) -> DataLoader:
         """Set train dataloader.
 
         :return: dataloader
         """
+        #torch.manual_seed(self.dataloader_seed)
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            #shuffle=True,
+            shuffle=False,
             num_workers=self.num_workers,
         )
 
