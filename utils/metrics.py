@@ -1,18 +1,23 @@
 """Module with functions for metrics calculation."""
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+
 import gc
 import pickle
+
+from tqdm import tqdm
 from pathlib import Path
+from scipy.stats import ttest_ind
 
 import pytorch_lightning as pl
 
 from utils import cpd_models, klcpd, tscp
+from utils.ensembles import CusumEnsembleCPDModel
 
 #------------------------------------------------------------------------------------------------------------#
 #                         Evaluate seq2seq, KL-CPD and TS-CP2 baseline models                                #
@@ -101,12 +106,6 @@ def calculate_conf_matrix_margin(
     TP_margin = tp_mask_margin.sum().item()
     FP_margin = fp_mask_margin.sum().item()
 
-    #print("real:", real)
-    #print("pred:", pred)
-    #print("Confusion:", TN_margin, FN_margin, TP_margin, FP_margin)
-    #print("Total num:", len(real))
-    #print("ok")
-
     assert((TN_margin + TP_margin + FN_margin + FP_margin) == len(real)), "Check TP, TN, FP, FN cases."    
     
     return TN_margin, FP_margin, FN_margin, TP_margin
@@ -154,7 +153,9 @@ def get_models_predictions(
     subseq_len: int = None,
     device: str = 'cuda',
     scale: int = None,
-    q: float = None
+    q: float = None,
+    step: int = 1,
+    alpha: float = 1.0
 ) -> List[torch.Tensor]:
     """Get model's prediction.
 
@@ -206,8 +207,12 @@ def get_models_predictions(
         uncertainties = None
         
     elif model_type == 'tscp':
-        #outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale)
-        outs = tscp.get_tscp_output_scaled_padded(model, inputs, model.window_1, model.window_2, scale=scale)
+        #outs = tscp.get_tscp_output_scaled(model, inputs, model.window_1, model.window_2, scale=scale, step=step)
+        #outs = tscp.get_tscp_output_scaled_padded(
+        #    model, inputs, model.window_1, model.window_2, scale=scale, step=step, alpha=alpha
+        #)
+        outs = tscp.get_tscp_output_padded(model, inputs, model.window_1, model.window_2, step=step)
+        outs = tscp.post_process_tscp_output(outs, scale=scale, alpha=alpha)
         uncertainties = None
 
     elif model_type == 'kl_cpd':
@@ -216,16 +221,16 @@ def get_models_predictions(
         
     elif model_type == "ensemble":
         # take mean values and std (as uncertainty measure)
-        outs, uncertainties = model.predict(inputs, scale=scale)
+        outs, uncertainties = model.predict(inputs, scale=scale, step=step, alpha=alpha)
 
     elif model_type == "ensemble_quantile":
-        outs, uncertainties = model.get_quantile_predictions(inputs, q)
+        outs, uncertainties = model.get_quantile_predictions(inputs, q, scale=scale)
 
     elif model_type == "ensemble_max":
-        outs, uncertainties = model.get_max_predictions(inputs)
+        outs, uncertainties = model.get_min_max_predictions(inputs, mode="max", scale=scale)
     
     elif model_type == "ensemble_min":
-        outs, uncertainties = model.get_min_predictions(inputs)
+        outs, uncertainties = model.get_min_max_predictions(inputs, mode="min", scale=scale)
 
     elif model_type == "cusum_aggr":
         outs = model.predict(inputs, scale=scale)
@@ -240,10 +245,10 @@ def get_models_predictions(
         uncertainties = None
     
     elif model_type == "fake_ensemble":
-        outs, uncertainties = inputs
+        outs, uncertainties = inputs[0], inputs[1]
     
     elif model_type == "fake_cusum":
-        outs = model.fake_predict(*inputs)
+        outs = model.fake_predict(inputs[0], inputs[1])
         uncertainties = None
         
     else:
@@ -251,19 +256,75 @@ def get_models_predictions(
         
     return outs, uncertainties, true_labels
 
-def evaluate_metrics_on_set(
+
+def collect_model_predictions_on_set(
     model: nn.Module,
     test_loader: DataLoader,
-    threshold: float = 0.5,
     verbose: bool = True,
     model_type: str = 'seq2seq',
     subseq_len: int = None, 
     device: str = 'cuda',
     scale: int = None,
-    uncert_th: float = None,
     q: float = None,
-    margin: int = None
+    step: int = 1,
+    alpha: float = 1.0
+):
+    if model is not None:
+        model.eval()
+        model.to(device)
     
+    test_out_bank, test_uncertainties_bank, test_labels_bank = [], [], []
+
+    with torch.no_grad():
+        if verbose:
+            print("Collectting model's outputs")
+        
+        # collect model's predictions once and reuse them 
+        for test_inputs, test_labels in tqdm(test_loader):
+            test_out, test_uncertainties, test_labels = get_models_predictions(
+                test_inputs,
+                test_labels,
+                model,
+                model_type=model_type,
+                subseq_len=subseq_len,
+                device=device,
+                scale=scale,
+                q=q,
+                step=step,
+                alpha=alpha
+            )
+
+            try:
+                test_out = test_out.squeeze(2)
+                test_uncertainties = test_uncertainties.squeeze(2)
+            except:
+                try:
+                    test_out = test_out.squeeze(1)
+                    test_uncertainties = test_uncertainties.squeeze(1)
+                except:
+                    test_out = test_out
+                    test_uncertainties = test_uncertainties
+
+            test_out_bank.append(test_out)
+            test_uncertainties_bank.append(test_uncertainties)
+            test_labels_bank.append(test_labels) 
+
+    del test_labels, test_out, test_uncertainties, test_inputs
+    gc.collect()
+    if 'cuda' in device:
+        torch.cuda.empty_cache()
+    
+    return test_out_bank, test_uncertainties_bank, test_labels_bank
+    
+def evaluate_metrics_on_set(
+    test_out_bank: List[torch.Tensor],
+    test_uncertainties_bank: List[torch.Tensor],
+    test_labels_bank: List[torch.Tensor],
+    threshold: float = 0.5,
+    verbose: bool = True,
+    device: str = 'cuda',
+    uncert_th: float = None,
+    margin: int = None,
 ) -> Tuple[int, int, int, int, float, float]:
     """Calculate metrics for CPD.
 
@@ -283,41 +344,17 @@ def evaluate_metrics_on_set(
         - mean detection delay
         - mean covering
     """
-    if model is not None:
-        model.eval()
-        model.to(device)    
-    
+
     FP_delays = []
     delays = []
     covers = []
     TN, FP, FN, TP = (0, 0, 0, 0)
     TN_margin, FP_margin, FN_margin, TP_margin = (0, 0, 0, 0)
-    
-    with torch.no_grad():
-            
-        for *test_inputs, test_labels in test_loader:
-            test_out, test_uncertainties, test_labels = get_models_predictions(
-                test_inputs,
-                test_labels,
-                model,
-                model_type=model_type,
-                subseq_len=subseq_len,
-                device=device,
-                scale=scale,
-                q=q
-            )
 
-            try:
-                test_out = test_out.squeeze(2)
-                test_uncertainties = test_uncertainties.squeeze(2)
-            except:
-                try:
-                    test_out = test_out.squeeze(1)
-                    test_uncertainties = test_uncertainties.squeeze(1)
-                except:
-                    test_out = test_out
-                    test_uncertainties = test_uncertainties
-            
+    with torch.no_grad():   
+        for test_out, test_uncertainties, test_labels in zip(
+            test_out_bank, test_uncertainties_bank, test_labels_bank
+        ):
             if test_uncertainties is not None and uncert_th is not None:
                 cropped_outs = (test_out > threshold) & (test_uncertainties < uncert_th)
                 
@@ -329,13 +366,7 @@ def evaluate_metrics_on_set(
                 (tn_margin, fp_margin, fn_margin, tp_margin)
             ) = calculate_metrics(
                 test_labels, cropped_outs, margin
-            )     
-
-            del test_labels
-            del test_out
-            gc.collect()
-            if 'cuda' in device:
-                torch.cuda.empty_cache() 
+            )
 
             TN += tn
             FP += fp
@@ -353,7 +384,6 @@ def evaluate_metrics_on_set(
             delays.append(delay.detach().cpu())
             covers.extend(cover)
 
-                        
     mean_FP_delay = torch.cat(FP_delays).float().mean().item()
     mean_delay = torch.cat(delays).float().mean().item()
     mean_cover = np.mean(covers)
@@ -367,10 +397,8 @@ def evaluate_metrics_on_set(
                 mean_cover
             )
         )
-    del FP_delays
-    del delays
-    del covers
-    
+
+    del FP_delays, delays, covers
     gc.collect()
     if 'cuda' in device:
         torch.cuda.empty_cache()         
@@ -480,8 +508,9 @@ def evaluation_pipeline(
     scale: int = None,
     uncert_th: float = None,
     q: float = None,
-    margin: int = None
-    
+    margin: int = None,
+    step: int = 1,
+    alpha: float = 1.0
 ) -> Tuple[Tuple[float], dict, dict]:
     """Evaluate trained CPD model.
 
@@ -509,8 +538,21 @@ def evaluation_pipeline(
         model.to(device)
         model.eval()
     except:
-        print('Cannot move model to device')    
+        print('Cannot move model to device')
     
+    test_out_bank, test_uncertainties_bank, test_labels_bank = collect_model_predictions_on_set(
+        model=model,
+        test_loader=test_dataloader,
+        verbose=verbose,
+        model_type=model_type,
+        subseq_len=subseq_len, 
+        device=device,
+        scale=scale,
+        q=q,
+        step=step,
+        alpha=alpha
+    )
+
     cover_dict = {}
     f1_dict = {}
 
@@ -526,7 +568,7 @@ def evaluation_pipeline(
         if verbose and len(threshold_list) > 1:
             print("No need in threshold list for CUSUM. Take threshold = 0.5.")
 
-    for threshold in tqdm(threshold_list):
+    for threshold in threshold_list:
         (
             (
                 TN, FP, FN, TP, mean_delay, mean_fp_delay, cover
@@ -535,17 +577,14 @@ def evaluation_pipeline(
                 TN_margin, FP_margin, FN_margin, TP_margin 
             )
         ) = evaluate_metrics_on_set(
-            model=model,
-            test_loader=test_dataloader,
+            test_out_bank=test_out_bank,
+            test_uncertainties_bank=test_uncertainties_bank,
+            test_labels_bank=test_labels_bank,
             threshold=threshold,
             verbose=verbose,
-            model_type=model_type,
-            subseq_len=subseq_len,
             device=device,
-            scale=scale,
             uncert_th=uncert_th,
-            q=q,
-            margin=margin
+            margin=margin,
             )
 
         confusion_matrix_dict[threshold] = (TN, FP, FN, TP)
@@ -556,7 +595,7 @@ def evaluation_pipeline(
         f1_dict[threshold] = F1_score((TN, FP, FN, TP))
 
         if margin is not None:
-           f1_margin_dict[threshold] = F1_score((TN_margin, FP_margin, FN_margin, TP_margin)) 
+            f1_margin_dict[threshold] = F1_score((TN_margin, FP_margin, FN_margin, TP_margin)) 
 
     if model_type == "cusum_aggr":
         auc = None
@@ -580,14 +619,13 @@ def evaluation_pipeline(
         best_th_f1_margin = max(f1_margin_dict, key=f1_margin_dict.get)
         max_f1_margin = f1_margin_dict[best_th_f1_margin]
     else:
-       best_th_f1_margin = None
-       max_f1_margin = None 
+        best_th_f1_margin = None
+        max_f1_margin = None 
     
     # Time to FA, detection delay
     best_time_to_FA = fp_delay_dict[best_th_f1]
     best_delay = delay_dict[best_th_f1]
 
-    
     if verbose:
         print('AUC:', round(auc, 4) if auc is not None else auc)
         print('Time to FA {}, delay detection {} for best-F1 threshold: {}'. format(round(best_time_to_FA, 4), 
@@ -612,6 +650,90 @@ def evaluation_pipeline(
     return (best_th_f1, best_time_to_FA, best_delay, auc, best_conf_matrix, best_f1, best_cover, 
             best_th_cover, max_cover), (best_th_f1_margin, max_f1_margin), delay_dict, fp_delay_dict
 
+
+def evaluate_cusum_model(
+    cusum_threshold_list: List[float],
+    output_dataloader: DataLoader,
+    margin: int,
+    args_config: Dict,
+    n_models: int,
+    save_path: str,
+    cusum_mode: str,
+    conditional: bool = False,
+    global_sigma: float = None,
+    lambda_null: float = None,
+    lambda_inf: float = None,
+    half_wnd: int = None,
+    var_coeff: float = 1.,
+    device: str = "cpu",
+    verbose: bool = True,
+    write_metrics_filename: str = None
+):
+    res_dict = {}
+    best_th = None
+    best_f1_global = 0
+
+    for cusum_th in tqdm(cusum_threshold_list):
+        cusum_model = CusumEnsembleCPDModel(
+            args=args_config, 
+            n_models=n_models,
+            global_sigma=global_sigma,
+            cusum_threshold=cusum_th,
+            cusum_mode=cusum_mode,
+            conditional=conditional,
+            lambda_null=lambda_null,
+            lambda_inf=lambda_inf,
+            half_wnd=half_wnd,
+            var_coeff=var_coeff
+        )
+        cusum_model.load_models_list(save_path)
+
+        print("cusum_th:", cusum_th)
+        metrics_local, (_, max_f1_margin), _, _ = evaluation_pipeline(
+            model=cusum_model,
+            test_dataloader=output_dataloader,
+            threshold_list=[0.5],
+            device=device,
+            model_type="fake_cusum",
+            verbose=True,
+            margin=margin
+        )
+
+        if write_metrics_filename is not None:
+            write_metrics_to_file(
+                filename=write_metrics_filename,
+                metrics=(metrics_local, (_, max_f1_margin)),
+                seed=None,
+                timestamp=datetime.now().strftime("%y%m%dT%H%M%S"),
+                comment=f"mode_{cusum_mode}_cond_{conditional}_cusum_th_{cusum_th}"
+            )
+
+        _, best_time_to_FA, best_delay, audc, _, best_f1, best_cover, _, max_cover = metrics_local
+        res_dict[cusum_th] = (audc, best_time_to_FA, best_delay, best_f1, best_cover, max_cover, max_f1_margin)
+
+        if best_f1 > best_f1_global:
+            best_f1_global = best_f1
+            best_th = cusum_th
+
+    if verbose:
+        _audc, _best_time_to_FA, _best_delay, _best_f1, _best_cover, _max_cover, _max_f1_margin = res_dict[best_th]
+        _audc = np.round(_audc, 4)
+        _best_time_to_FA = np.round(_best_time_to_FA, 4) 
+        _best_delay = np.round(_best_delay, 4)
+        _best_f1 = np.round(_best_f1, 4)
+        _best_cover = np.round(_best_cover, 4)
+        _max_cover = np.round(_max_cover, 4)
+        _max_f1_margin = np.round(_max_f1_margin, 4)
+        
+        print(f"Results for best threshold = {best_th}")
+        print(
+            f"AUDC: {_audc}, Time to FA: {_best_time_to_FA}, DD: {_best_delay}, F1: {_best_f1}, Cover: {_best_cover}, Max Cover: {_max_cover}, F1 with m = {margin}: {_max_f1_margin}"
+        )
+    return res_dict 
+
+
+
+   
 
 #------------------------------------------------------------------------------------------------------------#
 #                                      Evaluate classic baselines                                            #
@@ -929,3 +1051,69 @@ def evaluate_rej_rates_for_dataloader(
     rej_thresholds_dict = {rate: torch.quantile(all_uncerts, 1 - rate) for rate in rej_rates}
         
     return rej_thresholds_dict
+
+
+#------------------------------------------------------------------------------------------------------------#
+#                                Check std for Ensenble / Bayes models                                       #
+#------------------------------------------------------------------------------------------------------------#
+
+def compute_stds(
+    model,
+    test_dataloader: DataLoader,
+    windows_list: List[int],
+    scale: int = None,
+    step: int = 1,
+    alpha: float = 1.,
+    verbose: bool = True
+):
+    batch_bank, labels_bank, preds_std_bank = [], [], []
+    if verbose:
+        print("Computing model's outputs...")
+    for batch, labels in tqdm(test_dataloader):
+        _, preds_std = model.predict(batch, scale=scale, step=step, alpha=alpha)
+        batch_bank.append(batch)
+        labels_bank.append(labels), preds_std_bank.append(preds_std)
+
+    res_dict = {}
+    for window in windows_list:
+        if verbose:
+            print(f"Window: {window}")
+        normal_stds_list = []
+        cp_stds_list = []
+        for _, labels, preds_std in zip(batch_bank, labels_bank, preds_std_bank):
+            cp_idxs_batch = labels.cpu().argmax(axis=1)
+            for cp_idx, std_series in zip(cp_idxs_batch, preds_std):
+                
+                if cp_idx == 0:
+                    normal_stds_list.append(std_series.mean().item())
+                elif cp_idx < window + 1:
+                    cp_slice = std_series[:cp_idx + window]
+                    cp_stds_list.append(cp_slice.mean().item())
+                else:
+                    cp_slice = std_series[cp_idx - window : cp_idx + window]
+                    normal_slice = std_series[:cp_idx - window]
+                    cp_stds_list.append(cp_slice.mean().item())
+                    normal_stds_list.append(normal_slice.mean().item())
+        if verbose:
+            check_stds_equality(normal_stds_list, cp_stds_list)
+            print("-" * 50)
+
+        res_dict[window] = (normal_stds_list, cp_stds_list)
+    return res_dict
+
+def check_stds_equality(normal_stds_list, cp_stds_list, permutations=10000):
+    print("CP stds list:")
+    print(f"Mean = {np.mean(cp_stds_list)}, number is {len(cp_stds_list)}")
+
+    print("Normal stds list:")
+    print(f"Mean = {np.mean(normal_stds_list)}, number is {len(normal_stds_list)}")
+    
+    p_perm = ttest_ind(cp_stds_list, normal_stds_list, equal_var=False, permutations=permutations).pvalue
+    p_an = ttest_ind(cp_stds_list, normal_stds_list, equal_var=False).pvalue
+    
+    print(f"p_val analytical = {p_an}, p_val permutational = {p_perm}")
+    
+    if p_perm < 0.05 and p_an < 0.05:
+        print("Stds are not statistically equal")
+    else:
+        print("No conclusion")
