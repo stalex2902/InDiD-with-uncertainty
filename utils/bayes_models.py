@@ -12,12 +12,38 @@ from typing import Any, Tuple, List
 
 EPS = 1e-9
 
+def labels_to_window_mask(labels_batch: torch.Tensor, reg_mode: str, half_wnd: int = None):
+    """Utility for std regularization."""
+    
+    assert mode in ["window", "right_part"], f"Unknown mode {mode}."
+    
+    if mode == "window":
+        assert half_wnd is not None, "Specify half window size."
+        
+    cp_indexes = labels_batch.argmax(dim=1)
+    abnormal_wnd_mask = torch.zeros_like(labels_batch)
+
+    batch_size, seq_len = abnormal_wnd_mask.shape
+
+    for i in range(batch_size):
+        row_mask = torch.zeros(seq_len)
+        if cp_indexes[i] > 0:
+            if mode == "window":
+                wnd_start = max(cp_indexes[i] - half_wnd, 0)
+                wnd_end = min(cp_indexes[i] + half_wnd, seq_len)
+            else:
+                wnd_start = cp_indexes[i]
+                wnd_end = seq_len
+            # abnormal std window mask
+            row_mask[wnd_start : wnd_end + 1] = 1
+            abnormal_wnd_mask[i] = row_mask
+    return abnormal_wnd_mask
+
 ################################################################################################
 #                                         TOTAL BAYES                                          #
 ################################################################################################
 
 class BayesLSTM(nn.Module):
-    # TODO add num_layers parameter
     def __init__(
         self,
         input_dim,
@@ -330,7 +356,9 @@ class BayesCPDModel(pl.LightningModule):
         test_dataset: Dataset,
 
         kl_coeff: float = None,
-        n_samples: int = 10
+        n_samples: int = 10,
+        std_coeff: float = None,
+        half_std_wnd: int = None
 
     ) -> None:
         """Initialize CPD model.
@@ -376,16 +404,22 @@ class BayesCPDModel(pl.LightningModule):
                     args["loss_type"]
                 )
             )
-
-        self.kl_coeff = kl_coeff
         
         self.n_samples = n_samples
 
-        if self.kl_coeff is not None:
-            self.bkl_loss = bnn.BKLLoss()
-
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
+
+        self.kl_coeff = kl_coeff
+        self.std_coeff = std_coeff
+
+        if self.kl_coeff is not None:
+            self.bkl_loss = bnn.BKLLoss()
+        
+        if self.std_coeff is not None:
+            assert half_std_wnd is not None, "Specify wnd size for std regularization."
+
+        self.half_std_wnd = half_std_wnd 
 
     def __preprocess(self, inputs: torch.Tensor) -> torch.Tensor:
         """Preprocess batch before forwarding (i.e. apply extractor for video input).
@@ -419,7 +453,7 @@ class BayesCPDModel(pl.LightningModule):
         
         return preds
     
-    def predict(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def predict(self, inputs: torch.Tensor, scale: float = None, step: int = 1, alpha: float = 1.) -> Tuple[torch.Tensor, torch.Tensor]:
         
         preds = self.sample_predictions(inputs)
         
@@ -438,27 +472,40 @@ class BayesCPDModel(pl.LightningModule):
         inputs, labels = batch
         pred = self.forward(inputs.float())
 
-        train_loss = self.loss(pred.squeeze(), labels.float().squeeze())
-
+        loss = self.loss(pred.squeeze(), labels.float().squeeze())
+        
         train_accuracy = (
             ((pred.squeeze() > 0.5).long() == labels.squeeze()).float().mean()
         )
 
-        loss = train_loss
+        self.log("train_cpd_loss", loss, prog_bar=True)
 
         if self.kl_coeff is not None:
-            bkl_loss = self.bkl_loss(self.model)
+            bkl_loss = self.bkl_loss(self.model)[0]
             self.log("train_bkl_loss", bkl_loss, prog_bar=True)
 
-            loss = train_loss + self.kl_coeff * bkl_loss
+            loss += self.kl_coeff * bkl_loss
+
+        if self.std_coeff is not None:
+            std_wnd_mask = labels_to_window_mask(labels, mode="window", half_wnd=self.half_std_wnd)
+
+            _, std_preds = self.predict(inputs)
+
+            target_stds_abnorm = std_preds[std_wnd_mask == 1] 
+            sigma_loss_abnorm = torch.mean(target_stds_abnorm) if len(target_stds_abnorm) > 0 else 0.0
+
+            target_stds_norm = std_preds[std_wnd_mask == 0] 
+            sigma_loss_norm = torch.mean(target_stds_norm) if len(target_stds_norm) > 0 else 0.0
+
+            sigma_loss = sigma_loss_norm - sigma_loss_abnorm 
+
+            self.log("train_std_loss", sigma_loss, prog_bar=True)
+
+            loss += self.std_coeff * sigma_loss
             
-        self.log("train_loss", train_loss, prog_bar=True)
+        self.log("train_loss", loss, prog_bar=True)
         self.log("train_acc", train_accuracy, prog_bar=True)
         
-        if batch_idx % 10 == 0:
-            print("bkl_loss:", bkl_loss)
-            print("train_loss:", train_loss)
-
         return loss
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
@@ -470,21 +517,39 @@ class BayesCPDModel(pl.LightningModule):
         """
         inputs, labels = batch
         pred = self.forward(inputs.float())
-        val_loss = self.loss(pred.squeeze(), labels.float().squeeze())
+
+        loss = self.loss(pred.squeeze(), labels.float().squeeze())
 
         val_accuracy = (
             ((pred.squeeze() > 0.5).long() == labels.squeeze()).float().mean()
         )
 
-        loss = val_loss
+        self.log("val_cpd_loss", loss, prog_bar=True)
 
         if self.kl_coeff is not None:
-            bkl_loss = self.bkl_loss(self.model)
-            
+            bkl_loss = self.bkl_loss(self.model)[0]
+
             self.log("val_bkl_loss", bkl_loss, prog_bar=True)
-            loss = val_loss + self.kl_coeff * bkl_loss
+            loss += self.kl_coeff * bkl_loss
         
-        self.log("val_loss", val_loss, prog_bar=True)
+        if self.std_coeff is not None:
+            std_wnd_mask = labels_to_window_mask(labels, mode="window", half_wnd=self.half_std_wnd)
+
+            _, std_preds = self.predict(inputs)
+
+            target_stds_abnorm = std_preds[std_wnd_mask == 1] 
+            sigma_loss_abnorm = torch.mean(target_stds_abnorm) if len(target_stds_abnorm) > 0 else 0.0
+
+            target_stds_norm = std_preds[std_wnd_mask == 0] 
+            sigma_loss_norm = torch.mean(target_stds_norm) if len(target_stds_norm) > 0 else 0.0
+
+            sigma_loss = sigma_loss_norm - sigma_loss_abnorm
+
+            self.log("val_std_loss", sigma_loss, prog_bar=True)
+
+            loss += self.std_coeff * sigma_loss
+        
+        self.log("val_loss", loss, prog_bar=True)
         self.log("val_acc", val_accuracy, prog_bar=True)
 
         return loss
@@ -531,28 +596,38 @@ class CusumBayesCPDModel(BayesCPDModel):
         model: nn.Module,
         train_dataset: Dataset,
         test_dataset: Dataset,
+        
+        global_sigma: float = None,
         kl_coeff: float = None,
+        std_coeff: float = None,
         n_samples: int = 10,
-        scale_by_std: bool = True,
         cusum_threshold: float = 0.1,
-        cusum_mode: str = "correct"
+        cusum_mode: str = "correct",
+        conditional: bool = False,
+        lambda_null: float = None,
+        lambda_inf: float = None,
+        half_wnd: int = None,
+        var_coeff: float = 1.
+
     ) -> None:
-        super().__init__(args, model, train_dataset, test_dataset, kl_coeff, n_samples)
+        super().__init__(args, model, train_dataset, test_dataset, kl_coeff, n_samples, std_coeff)
+
+        assert cusum_mode in ["correct", "old", "new_criteria"], f"Wrong CUSUM mode: {cusum_mode}"
         
         self.cusum_threshold = cusum_threshold
-        self.scale_by_std = scale_by_std
         self.cusum_mode = cusum_mode
+        self.conditional = conditional
+        self.global_sigma = global_sigma
+        
+        self.lambda_null = lambda_null
+        self.lambda_inf = lambda_inf
+        self.half_wnd = half_wnd
+        
+        self.var_coeff = var_coeff
             
-    def cusum_detector_batch(
+    def cusum_detector(
         self, series_batch: torch.Tensor, series_std_batch: torch.Tensor
         ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute CUSUM change point detection.
-        
-        :param series_mean:
-        :param series_std:
-        
-        :returns: change_mask 
-        """
         batch_size, seq_len = series_batch.shape
         
         normal_to_change_stat = torch.zeros(batch_size, seq_len).to(series_batch.device)
@@ -561,15 +636,20 @@ class CusumBayesCPDModel(BayesCPDModel):
         for i in range(1, seq_len):
             # old CUSUM
             if self.cusum_mode == "old":
-                if self.scale_by_std:
+                if self.conditional:
                     t = (series_batch[:, i] - series_batch[:, i - 1]) / (series_std_batch[:, i] + EPS)
 
                 else:
-                    t = series_batch[:, i] - series_batch[:, i - 1]
+                    assert self.global_sigma is not None, "Specify global_sigma"
+                    t = series_batch[:, i] - series_batch[:, i - 1] / (self.global_sigma + EPS)
                     
             # new (correct) CUSUM
             else:
-                t = (series_batch[:, i] - 0.5) / (series_std_batch[:, i] ** 2 + EPS)
+                if self.conditional:
+                    t = (series_batch[:, i] - 0.5) / (series_std_batch[:, i] ** 2 + EPS)
+                else:
+                    assert self.global_sigma is not None, "Specify global_sigma"
+                    t = (series_batch[:, i] - 0.5) / (self.global_sigma ** 2 + EPS)
 
             normal_to_change_stat[:, i] = torch.maximum(
                 torch.zeros(batch_size).to(series_batch.device),
@@ -579,6 +659,46 @@ class CusumBayesCPDModel(BayesCPDModel):
             is_change = normal_to_change_stat[:, i] > torch.ones(batch_size).to(series_batch.device) * self.cusum_threshold
             change_mask[is_change, i:] = True
             
+        return change_mask, normal_to_change_stat
+    
+    def new_scores_aggregator(
+        self, series_batch: torch.Tensor, series_std_batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        assert self.global_sigma is not None, "Specify global_sigma"
+        assert self.lambda_null is not None, "Specify lambda_null"
+        assert self.lambda_inf is not None, "Specify lambda_inf"
+        assert self.half_wnd is not None, "Specify half_wnd"
+
+        batch_size, seq_len = series_batch.shape
+
+        normal_to_change_stat = torch.zeros(batch_size, seq_len).to(series_batch.device)
+        change_mask = torch.zeros(batch_size, seq_len).to(series_batch.device)
+
+        for i in range(1, seq_len):
+
+            if self.conditional:
+                t = (series_batch[:, i] - 0.5) / (series_std_batch[:, i] ** 2 + EPS)
+            else:
+                t = (series_batch[:, i] - 0.5) / (self.global_sigma ** 2 + EPS)
+
+            wnd_start = max(0, i - self.half_wnd)
+            wnd_end = min(seq_len, i + self.half_wnd + 1)
+            #wnd_end = i
+
+            windom_var_sum = self.var_coeff * sum([series_std_batch[:, k] ** 2 for k in range(wnd_start, wnd_end)])
+
+            normal_to_change_stat[:, i] = torch.maximum(
+                (self.lambda_inf - self.lambda_null) * windom_var_sum,
+                normal_to_change_stat[:, i - 1] + t
+            )
+
+            is_change = (
+                normal_to_change_stat[:, i] > 
+                torch.ones(batch_size).to(series_batch.device) * self.cusum_threshold
+            )
+            change_mask[is_change, i:] = True
+
         return change_mask, normal_to_change_stat
     
     def sample_cusum_trajectories(self, inputs):
@@ -594,7 +714,7 @@ class CusumBayesCPDModel(BayesCPDModel):
         
         for preds_traj in preds:
             # use one_like tensor of std's, do not take them into account
-            change_mask, normal_to_change_stat = self.cusum_detector_batch(preds_traj, preds_std)
+            change_mask, normal_to_change_stat = self.cusum_detector(preds_traj, preds_std)
             cusum_trajectories.append(normal_to_change_stat)
             change_masks.append(change_mask)
         
@@ -603,7 +723,7 @@ class CusumBayesCPDModel(BayesCPDModel):
         
         return change_masks, cusum_trajectories
        
-    def predict(self, inputs: torch.Tensor) -> torch.Tensor:
+    def predict(self, inputs: torch.Tensor, scale: float = None, step: int = 1, alpha: float = 1.0) -> torch.Tensor:
         """Make a prediction.
         
         :param inputs: input batch of sequences
@@ -614,9 +734,12 @@ class CusumBayesCPDModel(BayesCPDModel):
         
         preds_mean = torch.mean(preds, axis=0)
         preds_std = torch.std(preds, axis=0)
-               
-        change_masks, normal_to_change_stats = self.cusum_detector_batch(preds_mean, preds_std)
 
+        if self.cusum_mode in ["old", "correct"]:
+            change_masks, normal_to_change_stats = self.cusum_detector(preds_mean, preds_std)
+        else:
+            change_masks, normal_to_change_stats = self.new_scores_aggregator(preds_mean, preds_std)
+               
         self.preds_mean = preds_mean
         self.preds_std = preds_std
         self.change_masks = change_masks
@@ -645,6 +768,13 @@ class CusumBayesCPDModel(BayesCPDModel):
                 cusum_quantile_labels[b, cp_idxs_batch_aggr[b]:] = 1
         
         return cusum_quantile_labels
+    
+    def fake_predict(self, series_batch: torch.Tensor, series_std_batch: torch.Tensor):
+        """In case of pre-computed model outputs."""
+        if self.cusum_mode in ["old", "correct"]:
+            return self.cusum_detector(series_batch, series_std_batch)[0]
+        elif self.cusum_mode == "new_criteria":
+            return self.new_scores_aggregator(series_batch, series_std_batch)[0]
 
 
 ################################################################################################

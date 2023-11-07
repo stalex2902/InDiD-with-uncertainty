@@ -100,9 +100,8 @@ class CPDModel(pl.LightningModule):
         self.model = model
         
         if self.experiments_name in ["explosion", "road_accidents"]:
-            print("Loading extractor...")
             self.extractor = torch.hub.load(
-                "facebookresearch/pytorchvideo:main", "x3d_m", pretrained=True
+                "facebookresearch/pytorchvideo:main", "x3d_m", pretrained=True, verbose=False
             )
             self.extractor = nn.Sequential(*list(self.extractor.blocks[:5]))
 

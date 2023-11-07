@@ -2,7 +2,8 @@
 from .cpd_models import fix_seeds
 
 import collections
-collections.Iterable = collections.abc.Iterable # FOT FIX
+
+collections.Iterable = collections.abc.Iterable  # FOT FIX
 from collections import defaultdict
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -33,6 +34,7 @@ from torchvision.transforms._transforms_video import (
 )
 from tqdm import tqdm
 
+
 class CPDDatasets:
     """Class for experiments' datasets."""
 
@@ -62,7 +64,7 @@ class CPDDatasets:
             "mnist",
             "explosion",
             "road_accidents",
-            "yahoo"
+            "yahoo",
         ]:
             self.experiments_name = experiments_name
         elif experiments_name.startswith("synthetic"):
@@ -141,8 +143,8 @@ class CPDDatasets:
                 num_workers=0,
                 fps=30,
                 sampler="equal",
-                #sampler="downsample_anomaly",
-                #train_anomaly_num=self.train_anomaly_num,
+                # sampler="downsample_anomaly",
+                # train_anomaly_num=self.train_anomaly_num,
             )
 
             test_dataset = UCFVideoDataset(
@@ -155,16 +157,26 @@ class CPDDatasets:
                 fps=30,
                 sampler="downsample_norm",
             )
-            
+
         elif self.experiments_name == "yahoo":
             path_to_data = "../../data/yahoo/raw_yahoo"
             train_dataset = YAHOODataset(
-                path_to_data=path_to_data, wnd_size=150, step=5, dataset_size=None, seed=self.random_seed, is_train=True
+                path_to_data=path_to_data,
+                wnd_size=150,
+                step=5,
+                dataset_size=None,
+                seed=self.random_seed,
+                is_train=True,
             )
             test_dataset = YAHOODataset(
-                path_to_data=path_to_data, wnd_size=1000, step=50, dataset_size=None, seed=self.random_seed, is_train=False
+                path_to_data=path_to_data,
+                wnd_size=1000,
+                step=50,
+                dataset_size=None,
+                seed=self.random_seed,
+                is_train=False,
             )
-            
+
         return train_dataset, test_dataset
 
     def train_test_split_(
@@ -873,7 +885,7 @@ class UCFVideoDataset(Dataset):
                 max_size=max_samples // (len(normal_cp_paths) * 2),
             )
         else:
-            print("Equal sampling is impossible, do random sampling.")
+            # print("Equal sampling is impossible, do random sampling.")
             normal_from_cp = _random_sampling(
                 idxs_for_sampling=normal_cp_idxs, max_size=max_samples // 2
             )
@@ -889,7 +901,7 @@ class UCFVideoDataset(Dataset):
             )
 
         else:
-            print("Equal sampling is impossible, do random sampling.")
+            # print("Equal sampling is impossible, do random sampling.")
             normal = _random_sampling(idxs_for_sampling=normal_idxs, max_size=max_rest)
 
         # sometimes it's still not enough because of different video length
@@ -911,11 +923,18 @@ class UCFVideoDataset(Dataset):
 
 class YAHOODataset(Dataset):
     """Class for YAHOO! dataset."""
+
     def __init__(
-        self, path_to_data: str, wnd_size: int, step: int, dataset_size: int, seed: int, is_train: bool
+        self,
+        path_to_data: str,
+        wnd_size: int,
+        step: int,
+        dataset_size: int,
+        seed: int,
+        is_train: bool,
     ) -> None:
         """Initialize YAHOODataset. Extract subsequences with/without CPs from the long source time series.
-        
+
         :param path_to_data - path to the folder with raw YAHOO data
         :param wnd_size - size of the sequnces to be extracted
         :param step - margin between extracted sequences
@@ -923,23 +942,30 @@ class YAHOODataset(Dataset):
         :param seed - seed to be fixed for reproducibility
         """
         super().__init__()
-        
-        fix_seeds(seed)
-        
-        data, cp_idxs = self.extract_windows(Path(path_to_data) / 'A4Benchmark', wnd_size, step, is_train)
 
-        # permute dataset
-        perm = np.random.permutation(len(data))
-        data, cp_idxs = data[perm], cp_idxs[perm]
-        
-        if (dataset_size is None) or (dataset_size is not None and dataset_size > len(data)):
+        fix_seeds(seed)
+
+        data, cp_idxs = self.extract_windows(
+            Path(path_to_data) / "A4Benchmark", wnd_size, step, is_train
+        )
+
+        if (dataset_size is None) or (
+            dataset_size is not None and dataset_size > len(data)
+        ):
             self.data, self.cp_idxs = data, cp_idxs
         else:
             self.data, self.cp_idxs = data[:dataset_size,], cp_idxs[:dataset_size,]
-        
-    def extract_windows(self, path: Path, window_size: int, step: int, is_train: bool) -> Tuple[np.array, np.array]:
+
+        # permute train dataset
+        if is_train:
+            perm = np.random.permutation(len(self.data))
+            self.data, self.cp_idxs = self.data[perm], self.cp_idxs[perm]
+
+    def extract_windows(
+        self, path: Path, window_size: int, step: int, is_train: bool
+    ) -> Tuple[np.array, np.array]:
         """Extract sequences from the raw YAHOO time series.
-        
+
         :param path - path to the folder with raw YAHOO data
         :param window_size - size of the sequnces to be extracted
         :param step - margin between extracted sequences
@@ -947,8 +973,9 @@ class YAHOODataset(Dataset):
             * sequences with and without CPs
             * corresponding CP indices (0 in case of no CP in a sequence)
         """
+
         def _remove_anomalies(ts: np.array, anomalies: np.array) -> np.array:
-            """Remove anomalies from raw YAHOO time series. """
+            """Remove anomalies from raw YAHOO time series."""
             index = np.where(anomalies == 1)[0]
             for i in index:
                 if i > 0 and i + 1 < ts.shape[0]:
@@ -958,13 +985,13 @@ class YAHOODataset(Dataset):
                 if i == 0:
                     ts[i] = ts[i + 1]
             return ts
-        
+
         if os.path.isdir(path):
             files = os.listdir(path)
         else:
             files = [path]
         files.sort()
-        files.remove('A4Benchmark_all.csv')
+        files.remove("A4Benchmark_all.csv")
 
         train_size = int(0.7 * len(files))
         if is_train:
@@ -976,14 +1003,14 @@ class YAHOODataset(Dataset):
 
         for f in files:
             data = pd.read_csv(path / Path(f))
-            cp = data['changepoint']
+            cp = data["changepoint"]
             # remove anomalies
-            ts = _remove_anomalies(data['value'].values, data['anomaly'])
+            ts = _remove_anomalies(data["value"].values, data["anomaly"])
             # normalize
             ts = (ts - np.min(ts)) / (np.max(ts) - np.min(ts))
             for i in range(0, ts.shape[0] - window_size, step):
-                windows.append(np.array(ts[i:i + window_size]))
-                is_cp = np.where(cp[i:i + window_size] == 1)[0]
+                windows.append(np.array(ts[i : i + window_size]))
+                is_cp = np.where(cp[i : i + window_size] == 1)[0]
                 if is_cp.size == 0:
                     is_cp = [0]
                 labels.append(is_cp[0])
@@ -1009,26 +1036,53 @@ class YAHOODataset(Dataset):
         labels = np.zeros_like(sequence)
         sequence = np.expand_dims(sequence, axis=1)
         cp_idx = self.cp_idxs[idx]
-        if cp_idx > 0: 
+        if cp_idx > 0:
             labels[cp_idx:] = 1
 
         return sequence, labels
 
-#------------------------------------------------------------------------------------------------------------#
-#                                    Dataset to store model outputs                                          #
-#------------------------------------------------------------------------------------------------------------#
+
+# ------------------------------------------------------------------------------------------------------------#
+#                                    Datasets to store model outputs                                          #
+# ------------------------------------------------------------------------------------------------------------#
+
 
 class ModelOutputDataset(Dataset):
     """Fake dataset to store pre-computed model outputs for CUSUM model evaluation."""
+
     def __init__(self, test_out_bank, test_uncertainties_bank, test_labels_bank):
         super().__init__()
 
         self.test_out = list(torch.vstack(test_out_bank))
+
+        self.test_out = list(torch.cat(test_out_bank, dim=-2))
+        # mean_preds - (batch_size, seq_len); all models preds - (n_models, batch_size, seq_len)
+
         self.test_uncertainties = list(torch.vstack(test_uncertainties_bank))
         self.test_labels = list(torch.vstack(test_labels_bank))
 
     def __len__(self):
-        return len(self.test_out)
-    
+        return len(self.test_labels)
+
     def __getitem__(self, idx):
         return (self.test_out[idx], self.test_uncertainties[idx]), self.test_labels[idx]
+
+
+class AllModelsOutputDataset(Dataset):
+    """Fake dataset to store pre-computed all models' outputs for MMD model evaluation."""
+
+    def __init__(self, test_out_bank, test_labels_bank):
+        super().__init__()
+
+        self.test_out = list(
+            torch.cat(test_out_bank[:-1], dim=1).transpose(0, 1)
+        )  # drop last batch
+        # every prediction is (n_models, batch_size, seq_len)
+        self.test_labels = list(torch.vstack(test_labels_bank[:-1]))
+        # self.test_uncertainties = [None for _ in self.test_labels]
+
+    def __len__(self):
+        return len(self.test_labels)
+
+    def __getitem__(self, idx):
+        return self.test_out[idx], self.test_labels[idx]

@@ -54,7 +54,7 @@ def get_seq2seq_models_list(
               list with 1 CPD model in case of 'indid' or 'bce' loss
     """
     # Initialize core models for synthetic_1D, _100D and human_activity experiments
-    if args["experiments_name"] in ["synthetic_1D", "synthetic_100D", "human_activity"]:
+    if args["experiments_name"] in ["synthetic_1D", "synthetic_100D", "human_activity", "yahoo"]:
         # initialize default base model for Synthetic Normal 1D experiment
         core_model = core_models.BaseRnn(
             input_size=args["model"]["input_size"],

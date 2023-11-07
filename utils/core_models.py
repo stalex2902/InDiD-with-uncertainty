@@ -14,16 +14,28 @@ class LayerNormLSTM(nn.Module):
 
         if ln_type == 'before':
             #print("Add LayerNorm BEFORE each Linear layer")
-            self.linear_w = nn.ModuleList([nn.Sequential(nn.LayerNorm(self.input_dim), nn.Linear(self.input_dim, self.hidden_dim)) 
-                                           for _ in range(4)])
-            self.linear_u = nn.ModuleList([nn.Sequential(nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.hidden_dim))
-                                           for _ in range(4)])
+            self.linear_w = nn.ModuleList(
+                [
+                    nn.Sequential(nn.LayerNorm(self.input_dim), nn.Linear(self.input_dim, self.hidden_dim)) for _ in range(4)
+                ]
+            )
+            self.linear_u = nn.ModuleList(
+                [
+                    nn.Sequential(nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.hidden_dim)) for _ in range(4)
+                ]
+            )
         elif ln_type == "after":
             #print("Add LayerNorm AFTER each Linear layer")
-            self.linear_w = nn.ModuleList([nn.Sequential(nn.Linear(self.input_dim, self.hidden_dim), nn.LayerNorm(self.hidden_dim)) 
-                                           for _ in range(4)])
-            self.linear_u = nn.ModuleList([nn.Sequential(nn.Linear(self.hidden_dim, self.hidden_dim), nn.LayerNorm(self.hidden_dim))
-                                           for _ in range(4)])
+            self.linear_w = nn.ModuleList(
+                [
+                    nn.Sequential(nn.Linear(self.input_dim, self.hidden_dim), nn.LayerNorm(self.hidden_dim)) for _ in range(4)
+                ]
+            )
+            self.linear_u = nn.ModuleList(
+                [
+                    nn.Sequential(nn.Linear(self.hidden_dim, self.hidden_dim), nn.LayerNorm(self.hidden_dim)) for _ in range(4)
+                ]
+            )
             
         elif ln_type == "none":
             #print("DON'T add LayerNorm")

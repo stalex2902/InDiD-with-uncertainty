@@ -36,7 +36,6 @@ def get_test_parser():
     parser.add_argument("-tn", "--threshold_number", type=int, default=100, 
                         help='threshold number')
     parser.add_argument("--device", type=str, default="cpu", help='Device for evaluation')
-
     # boolean
     parser.add_argument("--verbose", default=False, type=lambda x: (str(x).lower() == 'true'), 
                         help='If true, print the metrics to the console.')
@@ -74,7 +73,7 @@ def get_classic_baseline_parser():
                         help='name of sdataset',
                         choices=["synthetic_1D", "synthetic_100D", "mnist", "human_activity", "explosion", "road_accidents"])
     parser.add_argument("--n_pred", type=int, default=None,
-                        help="Maximum number of predicted CPs (for ruptures models).")
+                        help="Number of predicted CPs (for ruptures models).")
     parser.add_argument("--pen", type=float, default=None,
                         help="Penalty parameter (for ruptures models).")
     parser.add_argument("--kernel", type=str, default="linear",

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 #                                      Loss                                             #
 # --------------------------------------------------------------------------------------#
 
+
 def _cosine_simililarity_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Compute 1D cosine distance between 2 tensors.
 
@@ -22,6 +23,7 @@ def _cosine_simililarity_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
     v = cos(x, y)
     return v
+
 
 def _cosine_simililarity_dim2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Compute 2D cosine distance between 2 tensors.
@@ -34,13 +36,11 @@ def _cosine_simililarity_dim2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     # v shape: (N, 2N)
     cos = nn.CosineSimilarity(dim=2, eps=1e-6)
     v = cos(x.unsqueeze(1), y.unsqueeze(0))
-    return v 
+    return v
+
 
 def nce_loss_fn(
-    history: torch.Tensor,
-    future: torch.Tensor,
-    similarity,
-    temperature: float = 0.1
+    history: torch.Tensor, future: torch.Tensor, similarity, temperature: float = 0.1
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute loss function for TS-CP2 model.
 
@@ -56,8 +56,8 @@ def nce_loss_fn(
     try:
         device = history.device
     except:
-        device = 'cpu'
-        
+        device = "cpu"
+
     criterion = torch.nn.BCEWithLogitsLoss()
     N = history.shape[0]
     sim = similarity(history, future)
@@ -65,29 +65,29 @@ def nce_loss_fn(
 
     tri_mask = torch.ones((N, N), dtype=bool)
     tri_mask[np.diag_indices(N)] = False
-    
-    neg = sim[tri_mask].reshape(N, N - 1)    
+
+    neg = sim[tri_mask].reshape(N, N - 1)
     all_sim = torch.exp(sim / temperature)
-    
+
     logits = torch.divide(torch.sum(pos_sim), torch.sum(all_sim, axis=1))
-        
+
     lbl = torch.ones(history.shape[0]).to(device)
     # categorical cross entropy
-    loss = criterion(logits, lbl)    
-    
+    loss = criterion(logits, lbl)
+
     mean_sim = torch.mean(torch.diag(sim))
     mean_neg = torch.mean(neg)
     return loss, mean_sim, mean_neg
-    
+
 
 # --------------------------------------------------------------------------------------#
 #                               Data preprocessing                                      #
 # --------------------------------------------------------------------------------------#
 
+
 def history_future_separation(
-    data: torch.Tensor,
-    window: int
- ) -> Tuple[torch.Tensor, torch.Tensor]:
+    data: torch.Tensor, window: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Split sequences in batch on two equal slices.
 
     :param data: input sequences
@@ -96,12 +96,13 @@ def history_future_separation(
     """
     if len(data.shape) <= 4:
         history = data[:, :window]
-        future = data[:, window:2*window]    
+        future = data[:, window : 2 * window]
     elif len(data.shape) == 5:
         history = data[:, :, :window]
-        future = data[:, :, window:2*window]    
-        
+        future = data[:, :, window : 2 * window]
+
     return history, future
+
 
 def history_future_separation_test(
     data: torch.Tensor,
@@ -144,6 +145,7 @@ def history_future_separation_test(
 
     return history_slices, future_slices
 
+
 # --------------------------------------------------------------------------------------#
 #                                   Predictions                                         #
 # --------------------------------------------------------------------------------------#
@@ -155,6 +157,7 @@ def ema_batch(outputs, alpha):
         ema_outputs[:, t] = alpha * outputs[:, t] + (1 - alpha) * ema_outputs[:, t - 1]
 
     return ema_outputs
+
 
 def get_tscp_output(
     tscp_model: nn.Module,
@@ -171,6 +174,8 @@ def get_tscp_output(
     :param window_2: "future" subsequence size (default None), if None set equal to window_1
     :return: predicted change probability
     """
+    tscp_model.eval()
+
     device = tscp_model.device
     batch = batch.to(device)
 
@@ -182,19 +187,20 @@ def get_tscp_output(
     batch_history_slices, batch_future_slices = history_future_separation_test(
         batch, window_1, window_2, step=step
     )
-    
+
     pred_out = []
     crop_size = seq_len - (window_1 + window_2 - 1)
     for history_slice, future_slice in zip(batch_history_slices, batch_future_slices):
-        zeros = torch.ones(1, seq_len)        
+        zeros = torch.ones(1, seq_len)
         curr_history, curr_future = map(tscp_model, [history_slice, future_slice])
         rep_sim = _cosine_simililarity_dim1(curr_history, curr_future).data
         # duplicate similarities in case of step > 1, crop the remainder
         rep_sim = torch.repeat_interleave(rep_sim, step, dim=0)[:crop_size]
         zeros[:, window_1 + window_2 - 1 :] = rep_sim
         pred_out.append(zeros)
-        
+
     pred_out = torch.cat(pred_out).to(batch.device)
+    pred_out = pred_out[:, window_1 + window_2 - 1 :]
 
     return pred_out
 
@@ -204,7 +210,7 @@ def get_tscp_output_padded(
     batch: torch.Tensor,
     window_1: int,
     window_2: Optional[int] = None,
-    step: int = 1, 
+    step: int = 1,
 ) -> List[torch.Tensor]:
     """Get TS-CP2 predictions scaled to [0, 1].
 
@@ -215,28 +221,40 @@ def get_tscp_output_padded(
     :param scales: scale factor
     :return: predicted change probability
     """
+    tscp_model.eval()
+
     device = tscp_model.device
     batch = batch.to(device)
 
     # for 'synthetic1D', 'synthetic100D', 'human_activity' and "yahoo" datasets
     if len(batch.shape) == 3:
         seq_len = batch.shape[1]
-        prepend = batch[:, 0 : window_1, :]
-        append = batch[:, -window_2 : -1, :] #.unsqueeze(dim=1).repeat(1, window_2 - 1, 1)
-        batch = torch.hstack((prepend, batch, append))
-    
-    # for 'mnist' dataset
-    elif len(batch.shape) == 4: 
-        seq_len = batch.shape[1]
-        prepend = batch[:, 0 : window_1, :, :]#.unsqueeze(dim=1).repeat(1, window_1, 1, 1)
-        append = batch[:, -window_2 : -1, :, :]#.unsqueeze(dim=1).repeat(1, window_2 - 1, 1, 1)
+        prepend = batch[:, 0:window_1, :]
+        append = batch[
+            :, -window_2:-1, :
+        ]  # .unsqueeze(dim=1).repeat(1, window_2 - 1, 1)
         batch = torch.hstack((prepend, batch, append))
 
-    # for video datasets 
+    # for 'mnist' dataset
+    elif len(batch.shape) == 4:
+        seq_len = batch.shape[1]
+        prepend = batch[
+            :, 0:window_1, :, :
+        ]  # .unsqueeze(dim=1).repeat(1, window_1, 1, 1)
+        append = batch[
+            :, -window_2:-1, :, :
+        ]  # .unsqueeze(dim=1).repeat(1, window_2 - 1, 1, 1)
+        batch = torch.hstack((prepend, batch, append))
+
+    # for video datasets
     else:
         seq_len = batch.shape[2]
-        prepend = batch[:, :, 0 : window_1, :, :]#.unsqueeze(dim=2).repeat(1, 1, window_1, 1, 1)
-        append = batch[:, :, -window_2 : -1, :, :]#.unsqueeze(dim=2).repeat(1, 1, window_2 - 1, 1, 1)
+        prepend = batch[
+            :, :, 0:window_1, :, :
+        ]  # .unsqueeze(dim=2).repeat(1, 1, window_1, 1, 1)
+        append = batch[
+            :, :, -window_2:-1, :, :
+        ]  # .unsqueeze(dim=2).repeat(1, 1, window_2 - 1, 1, 1)
         batch = torch.dstack((prepend, batch, append))
 
     batch_history_slices, batch_future_slices = history_future_separation_test(
@@ -245,13 +263,16 @@ def get_tscp_output_padded(
     pred_out = []
     for history_slice, future_slice in zip(batch_history_slices, batch_future_slices):
         curr_history, curr_future = map(tscp_model, [history_slice, future_slice])
-        rep_sim = _cosine_simililarity_dim1(curr_history, curr_future).data.unsqueeze(dim=0)
+        rep_sim = _cosine_simililarity_dim1(curr_history, curr_future).data.unsqueeze(
+            dim=0
+        )
         # duplicate similarities in case of step > 1, crop the remainder
         rep_sim = torch.repeat_interleave(rep_sim, step, dim=1)[:, :seq_len]
         pred_out.append(rep_sim)
-        
+
     pred_out = torch.cat(pred_out).to(batch.device)
     return pred_out
+
 
 '''
 def post_process_tscp_output(outputs: torch.Tensor, scale: float = 1., alpha: float = 1.) -> torch.Tensor:
@@ -280,8 +301,11 @@ def post_process_tscp_output(outputs: torch.Tensor, scale: float = 1., alpha: fl
     return preds
 '''
 
-def post_process_tscp_output(outputs: torch.Tensor, scale: float = 1., alpha: float = 1.) -> torch.Tensor:    
-    preds = 1. - torch.where(outputs >= 0, outputs, torch.zeros_like(outputs))
+
+def post_process_tscp_output(
+    outputs: torch.Tensor, scale: float = 1.0, alpha: float = 1.0
+) -> torch.Tensor:
+    preds = 1.0 - torch.where(outputs >= 0, outputs, torch.zeros_like(outputs))
     preds = ema_batch(preds, alpha)
     return preds
 
@@ -289,6 +313,7 @@ def post_process_tscp_output(outputs: torch.Tensor, scale: float = 1., alpha: fl
 # --------------------------------------------------------------------------------------#
 #                                      Models                                           #
 # --------------------------------------------------------------------------------------#
+
 
 class ResidualBlock(nn.Module):
     def __init__(
@@ -300,11 +325,11 @@ class ResidualBlock(nn.Module):
         dropout_rate: float = 0,
         use_batch_norm: bool = False,
         use_layer_norm: bool = False,
-        use_weight_norm: bool = False, 
-        training: bool = True
+        use_weight_norm: bool = False,
+        training: bool = True,
     ) -> None:
         """Defines the residual block for the WaveNet TCN.
-    
+
         :param in_channels: number of input channels
         :param dilation_rate: the dilation power of 2 we are using for this residual block
         :param nb_filters: the number of convolutional filters to use in this block
@@ -313,7 +338,7 @@ class ResidualBlock(nn.Module):
         :param use_batch norm: if True, apply batch norm
         :param use_layer_norms: if True, apply normalization along the layer
         :param use_weight_norm: if True, normalize the weights
-        :param training: indicates training or testing mode 
+        :param training: indicates training or testing mode
         """
         self.in_channels = in_channels
         self.dilation_rate = dilation_rate
@@ -323,52 +348,64 @@ class ResidualBlock(nn.Module):
 
         # for causal padding
         self.padding = (self.kernel_size - 1) * self.dilation_rate
-        
+
         self.use_batch_norm = use_batch_norm
         self.use_layer_norm = use_layer_norm
         self.use_weight_norm = use_weight_norm
-        
+
         self.training = training
 
         super().__init__()
-        
-        self.conv_1 = nn.Conv1d(self.in_channels, self.nb_filters, self.kernel_size, 
-                                padding=0, dilation=self.dilation_rate)        
+
+        self.conv_1 = nn.Conv1d(
+            self.in_channels,
+            self.nb_filters,
+            self.kernel_size,
+            padding=0,
+            dilation=self.dilation_rate,
+        )
         if self.use_weight_norm:
-            weight_norm(self.conv_1) 
+            weight_norm(self.conv_1)
         self.bn_1 = nn.BatchNorm1d(self.nb_filters)
-        self.ln_1 = nn.LayerNorm(self.nb_filters)              
+        self.ln_1 = nn.LayerNorm(self.nb_filters)
         self.relu_1 = nn.ReLU()
 
-        self.conv_2 = nn.Conv1d(self.nb_filters, self.nb_filters, self.kernel_size, 
-                                padding=0, dilation=self.dilation_rate)        
+        self.conv_2 = nn.Conv1d(
+            self.nb_filters,
+            self.nb_filters,
+            self.kernel_size,
+            padding=0,
+            dilation=self.dilation_rate,
+        )
         if self.use_weight_norm:
-            weight_norm(self.conv_1)    
+            weight_norm(self.conv_1)
         self.bn_2 = nn.BatchNorm1d(self.nb_filters)
-        self.ln_2 = nn.LayerNorm(self.nb_filters)              
-        self.relu_2 = nn.ReLU()        
-        
+        self.ln_2 = nn.LayerNorm(self.nb_filters)
+        self.relu_2 = nn.ReLU()
+
         self.conv_block = nn.Sequential()
-        self.downsample = nn.Conv1d(
-            in_channels, self.nb_filters, kernel_size=1
-        ) if in_channels != self.nb_filters else nn.Identity()
-        
-        self.relu = nn.ReLU()  
-                
+        self.downsample = (
+            nn.Conv1d(in_channels, self.nb_filters, kernel_size=1)
+            if in_channels != self.nb_filters
+            else nn.Identity()
+        )
+
+        self.relu = nn.ReLU()
+
         self.init_weights()
-        
+
     def init_weights(self) -> None:
         """Initialize weights with Normal distribution."""
         torch.nn.init.normal_(self.conv_1.weight, mean=0, std=0.05)
-        torch.nn.init.zeros_(self.conv_1.bias)            
-        
+        torch.nn.init.zeros_(self.conv_1.bias)
+
         torch.nn.init.normal_(self.conv_2.weight, mean=0, std=0.05)
-        torch.nn.init.zeros_(self.conv_2.bias)            
-        
-        if isinstance(self.downsample, nn.Conv1d):         
+        torch.nn.init.zeros_(self.conv_2.bias)
+
+        if isinstance(self.downsample, nn.Conv1d):
             torch.nn.init.normal_(self.downsample.weight, mean=0, std=0.05)
-            torch.nn.init.zeros_(self.downsample.bias)                    
-            
+            torch.nn.init.zeros_(self.downsample.bias)
+
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
         """Do forward pass through the model.
 
@@ -377,21 +414,21 @@ class ResidualBlock(nn.Module):
             - result (output)
             - skip_out (with skip-connections)
         """
-        # do causal padding        
+        # do causal padding
         out = F.pad(inp, (self.padding, 0))
         out = self.conv_1(out)
-        
+
         if self.use_batch_norm:
             out = self.bn_1(out)
         elif self.use_layer_norm:
-            out = self.ln_1(out)        
+            out = self.ln_1(out)
         out = self.relu_1(out)
-        
+
         # spatial dropout
-        out = out.permute(0, 2, 1)   # convert to [batch, time, channels]
-        out = F.dropout2d(out, self.dropout_rate, training=self.training)        
-        out = out.permute(0, 2, 1)   # back to [batch, channels, time]    
-        
+        out = out.permute(0, 2, 1)  # convert to [batch, time, channels]
+        out = F.dropout2d(out, self.dropout_rate, training=self.training)
+        out = out.permute(0, 2, 1)  # back to [batch, channels, time]
+
         # do causal padding
         out = F.pad(out, (self.padding, 0))
         out = self.conv_2(out)
@@ -399,19 +436,19 @@ class ResidualBlock(nn.Module):
             out = self.bn_2(out)
         elif self.use_layer_norm:
             out = self.ln_2(out)
-        out = self.relu_2(out)            
-        out = self.relu_2(out)    
-        
-        out = out.permute(0, 2, 1)   # convert to [batch, time, channels]
+        out = self.relu_2(out)
+        out = self.relu_2(out)
+
+        out = out.permute(0, 2, 1)  # convert to [batch, time, channels]
         out = F.dropout2d(out, self.dropout_rate, training=self.training)
-        out = out.permute(0, 2, 1)   # back to [batch, channels, time]            
-        
+        out = out.permute(0, 2, 1)  # back to [batch, channels, time]
+
         skip_out = self.downsample(inp)
         res = self.relu(out + skip_out)
         return res, skip_out
 
-    
-class TCN(nn.Module):  
+
+class TCN(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -420,10 +457,10 @@ class TCN(nn.Module):
         nb_stacks: int,
         dilations: List[int],
         use_skip_connections: bool,
-        dropout_rate: float, 
+        dropout_rate: float,
         use_batch_norm: bool,
         use_layer_norm: bool,
-        use_weight_norm: bool
+        use_weight_norm: bool,
     ) -> None:
         """Initialize TCN model.
 
@@ -439,43 +476,50 @@ class TCN(nn.Module):
         :param use_weight_norm: if True, normalize the weights
         """
         super().__init__()
-        
+
         self.dropout_rate = dropout_rate
         self.use_skip_connections = use_skip_connections
         self.dilations = dilations
         self.nb_stacks = nb_stacks
         self.kernel_size = kernel_size
         self.nb_filters = nb_filters
-        
+
         self.use_batch_norm = use_batch_norm
         self.use_layer_norm = use_layer_norm
         self.use_weight_norm = use_weight_norm
         self.in_channels = in_channels
-        
+
         if self.use_batch_norm + self.use_layer_norm + self.use_weight_norm > 1:
-            raise ValueError('Only one normalization can be specified at once.')        
-        
-        self.residual_blocks = []        
+            raise ValueError("Only one normalization can be specified at once.")
+
+        self.residual_blocks = []
         res_block_filters = 0
         for s in range(self.nb_stacks):
             for i, d in enumerate(self.dilations):
-                in_channels = self.in_channels if i + s == 0 else res_block_filters                
-                res_block_filters = self.nb_filters[i] if isinstance(self.nb_filters, list) else self.nb_filters
-                self.residual_blocks.append(ResidualBlock(in_channels=in_channels, 
-                                                          dilation_rate=d,
-                                                          nb_filters=res_block_filters,
-                                                          kernel_size=self.kernel_size,
-                                                          dropout_rate=self.dropout_rate, 
-                                                          use_batch_norm=self.use_batch_norm,
-                                                          use_layer_norm=self.use_layer_norm,
-                                                          use_weight_norm=self.use_weight_norm))
+                in_channels = self.in_channels if i + s == 0 else res_block_filters
+                res_block_filters = (
+                    self.nb_filters[i]
+                    if isinstance(self.nb_filters, list)
+                    else self.nb_filters
+                )
+                self.residual_blocks.append(
+                    ResidualBlock(
+                        in_channels=in_channels,
+                        dilation_rate=d,
+                        nb_filters=res_block_filters,
+                        kernel_size=self.kernel_size,
+                        dropout_rate=self.dropout_rate,
+                        use_batch_norm=self.use_batch_norm,
+                        use_layer_norm=self.use_layer_norm,
+                        use_weight_norm=self.use_weight_norm,
+                    )
+                )
 
-        
         self.residual_blocks = nn.ModuleList(self.residual_blocks)
-                                            
+
     def forward(self, inp: torch.Tensor) -> torch.Tensor:
         """Do forward pass through the model.
-        
+
         :param inp: input tensor
         :return: output
         """
@@ -488,20 +532,17 @@ class TCN(nn.Module):
 
 
 class BaseTSCPEncoder(nn.Module):
-    def __init__(
-        self,
-        args: dict
-    ) -> None:
+    def __init__(self, args: dict) -> None:
         """Initialize TS-CP2 Encoder model for synthtic Normal experiments.
 
         :param args: dict with all the parameters
-        """ 
+        """
         super().__init__()
 
         self.c_in = args["model"]["c_in"]
-        
-        #print("c_in:", self.c_in)
-        
+
+        # print("c_in:", self.c_in)
+
         self.nb_filters = args["model"]["nb_filters"]
         self.kernel_size = args["model"]["kernel_size"]
         self.nb_stacks = args["model"]["nb_stacks"]
@@ -525,14 +566,14 @@ class BaseTSCPEncoder(nn.Module):
             dropout_rate=self.dropout_rate,
             use_batch_norm=self.use_batch_norm,
             use_layer_norm=self.use_layer_norm,
-            use_weight_norm=self.use_weight_norm
+            use_weight_norm=self.use_weight_norm,
         )
 
         self.fc1 = nn.Linear(self.nb_filters * self.seq_len, 2 * self.n_steps)
-        self.fc2 = nn.Linear(2 * self.n_steps, self.n_steps)    
-        self.output_layer = nn.Linear(self.n_steps, self.code_size)         
+        self.fc2 = nn.Linear(2 * self.n_steps, self.n_steps)
+        self.output_layer = nn.Linear(self.n_steps, self.code_size)
         self.relu = nn.ReLU()
-                
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Do forward pass through the model.
 
@@ -540,23 +581,25 @@ class BaseTSCPEncoder(nn.Module):
         :return: output
         """
         batch_size, seq_len = x.shape[0], x.shape[1]
-        out = x.reshape(batch_size, -1, seq_len).float() # shape is (batch_size, c_in, timesteps)
+        out = x.reshape(
+            batch_size, -1, seq_len
+        ).float()  # shape is (batch_size, c_in, timesteps)
         out = self.tcn_layer(out)
         out = out.flatten(1, 2)
         out = self.relu(self.fc1(out))
         out = self.relu(self.fc2(out))
-        out = self.output_layer(out)     
+        out = self.output_layer(out)
         return out
+
 
 class TSCP_model(pl.LightningModule):
     def __init__(
         self,
         args: dict,
-        model: nn.Module,     
-        train_dataset: Dataset, 
+        model: nn.Module,
+        train_dataset: Dataset,
         test_dataset: Dataset,
-
-        dataloader_seed: int = 42 
+        dataloader_seed: int = 42,
     ) -> None:
         """Initialize TC-CP2 model (lightning wrapper).
 
@@ -566,7 +609,7 @@ class TSCP_model(pl.LightningModule):
         :param test_dataset: test dataset
         """
         super().__init__()
-                    
+
         self.model = model
 
         # Feature extractor for video datasets
@@ -582,19 +625,19 @@ class TSCP_model(pl.LightningModule):
                 param.requires_grad = False
 
         else:
-            self.extractor = None 
+            self.extractor = None
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
-        
+
         self.batch_size = args["learning"]["batch_size"]
-        self.num_workers = args["num_workers"]        
-        
+        self.num_workers = args["num_workers"]
+
         self.temperature = args["loss"]["temperature"]
-        
+
         self.lr = args["learning"]["lr"]
-        self.decay_steps = args["learning"]["decay_steps"]   
-        
+        self.decay_steps = args["learning"]["decay_steps"]
+
         self.window = args["model"]["window"]
         self.window_1 = args["model"]["window_1"]
         self.window_2 = args["model"]["window_2"]
@@ -607,7 +650,7 @@ class TSCP_model(pl.LightningModule):
         """Preprocess batch before forwarding (i.e. apply extractor for video input).
 
         :param input: input torch.Tensor
-        :return: processed input tensor to be fed into .forward method 
+        :return: processed input tensor to be fed into .forward method
         """
         if self.experiments_name in ["explosion", "road_accidents"]:
             input = self.extractor(input.float())  # batch_size, C, seq_len, H, W
@@ -618,13 +661,13 @@ class TSCP_model(pl.LightningModule):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Do forward pass through the model.
-        
+
         :param inputs: input tensor
         :return: output
         """
         inputs = self.__preprocess(inputs)
         return self.model(inputs)
-    
+
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         """Training step for TS-CP2 model.
 
@@ -632,22 +675,26 @@ class TSCP_model(pl.LightningModule):
         :param batch_idx: index of batch
         :return: loss function value
         """
-        history, future = history_future_separation(batch[0], self.window)        
+        history, future = history_future_separation(batch[0], self.window)
         history_emb = self.forward(history.float())
-        future_emb = self.forward(future.float()) 
+        future_emb = self.forward(future.float())
 
         history_emb = nn.functional.normalize(history_emb, p=2, dim=1)
         future_emb = nn.functional.normalize(future_emb, p=2, dim=1)
 
-        train_loss, pos_sim, neg_sim = nce_loss_fn(history_emb, future_emb, similarity=_cosine_simililarity_dim2, 
-                                                   temperature=self.temperature)
+        train_loss, pos_sim, neg_sim = nce_loss_fn(
+            history_emb,
+            future_emb,
+            similarity=_cosine_simililarity_dim2,
+            temperature=self.temperature,
+        )
 
-        self.log("train_loss", train_loss, prog_bar=True, on_epoch=True)     
-        self.log("pos_sim", pos_sim, prog_bar=True, on_epoch=True)        
-        self.log("neg_sim", neg_sim, prog_bar=True, on_epoch=True)        
+        self.log("train_loss", train_loss, prog_bar=True, on_epoch=True)
+        self.log("pos_sim", pos_sim, prog_bar=True, on_epoch=True)
+        self.log("neg_sim", neg_sim, prog_bar=True, on_epoch=True)
 
         return train_loss
-        
+
     def validation_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         """Validation step for TS-CP2 model.
 
@@ -655,19 +702,22 @@ class TSCP_model(pl.LightningModule):
         :param batch_idx: index of batch
         :return: loss function value
         """
-        history, future = history_future_separation(batch[0], self.window)        
-                
+        history, future = history_future_separation(batch[0], self.window)
+
         history_emb = self.forward(history.float())
-        future_emb = self.forward(future.float()) 
-                
+        future_emb = self.forward(future.float())
+
         history_emb = nn.functional.normalize(history_emb, p=2, dim=1)
         future_emb = nn.functional.normalize(future_emb, p=2, dim=1)
-        
 
-        val_loss, pos_sim, neg_sim = nce_loss_fn(history_emb, future_emb, similarity=_cosine_simililarity_dim2, 
-                                                 temperature=self.temperature)
+        val_loss, pos_sim, neg_sim = nce_loss_fn(
+            history_emb,
+            future_emb,
+            similarity=_cosine_simililarity_dim2,
+            temperature=self.temperature,
+        )
 
-        self.log("val_loss", val_loss, prog_bar=True)     
+        self.log("val_loss", val_loss, prog_bar=True)
         return val_loss
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
@@ -676,7 +726,9 @@ class TSCP_model(pl.LightningModule):
         :return: optimizer for training TS-CP2 model
         """
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=opt, T_max=self.decay_steps)
+        lr = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=opt, T_max=self.decay_steps
+        )
         return {"optimizer": opt, "lr_scheduler": lr}
 
     def train_dataloader(self) -> DataLoader:
@@ -684,13 +736,10 @@ class TSCP_model(pl.LightningModule):
 
         :return: dataloader
         """
-        #torch.manual_seed(self.dataloader_seed)
-
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            #shuffle=True,
-            shuffle=False,
+            shuffle=True,
             num_workers=self.num_workers,
         )
 

@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 import pytorch_lightning as pl
 
+
 # --------------------------------------------------------------------------------------#
 #                                          Loss                                         #
 # --------------------------------------------------------------------------------------#
@@ -23,7 +24,7 @@ def median_heuristic(med_sqdist: float, beta: float = 0.5) -> List[float]:
     :param beta: target sigma
     :return: list of possible sigmas
     """
-    beta_list = [beta ** 2, beta ** 1, 1, (1.0 / beta) ** 1, (1.0 / beta) ** 2]
+    beta_list = [beta**2, beta**1, 1, (1.0 / beta) ** 1, (1.0 / beta) ** 2]
     return [med_sqdist * b for b in beta_list]
 
 
@@ -132,11 +133,11 @@ def mmd_loss_disc(
 #                             Data preprocessing                                        #
 # --------------------------------------------------------------------------------------#
 
+
 # separation for training
 def history_future_separation(
-    data: torch.Tensor,
-    window: int
- ) -> Tuple[torch.Tensor, torch.Tensor]:
+    data: torch.Tensor, window: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Split sequences in batch on two equal slices.
 
     :param data: input sequences
@@ -146,13 +147,13 @@ def history_future_separation(
     # for all the datasets, except video data
     if len(data.shape) <= 4:
         history = data[:, :window]
-        future = data[:, window:2*window]
+        future = data[:, window : 2 * window]
 
-    # for video data 
+    # for video data
     elif len(data.shape) == 5:
         history = data[:, :, :window]
-        future = data[:, :, window:2*window]    
-        
+        future = data[:, :, window : 2 * window]
+
     return history, future
 
 
@@ -198,6 +199,7 @@ def history_future_separation_test(
 
     return history_slices, future_slices
 
+
 # --------------------------------------------------------------------------------------#
 #                                     Predictions                                       #
 # --------------------------------------------------------------------------------------#
@@ -206,7 +208,7 @@ def get_klcpd_output_scaled(
     batch: torch.Tensor,
     window_1: int,
     window_2: Optional[int] = None,
-    scale: float = 1.,
+    scale: float = 1.0,
 ) -> List[torch.Tensor]:
     """Get KL-CPD predictions scaled to [0, 1].
 
@@ -233,7 +235,9 @@ def get_klcpd_output_scaled(
     pred_out = []
     for i in range(len(batch_history_slices)):
         zeros = torch.zeros(1, seq_len)
-        mmd_scores = kl_cpd_model.get_disc_embeddings(batch_history_slices[i], batch_future_slices[i])
+        mmd_scores = kl_cpd_model.get_disc_embeddings(
+            batch_history_slices[i], batch_future_slices[i]
+        )
         zeros[:, window_1 + window_2 - 1 :] = mmd_scores
         pred_out.append(zeros)
 
@@ -256,23 +260,35 @@ class NetG(nn.Module):
         self.rnn_hid_dim = args["model"]["rnn_hid_dim"]
         self.num_layers = args["model"]["num_layers"]
 
-        self.rnn_enc_layer = nn.GRU(self.input_dim, self.rnn_hid_dim, num_layers=self.num_layers, batch_first=True)
-        self.rnn_dec_layer = nn.GRU(self.input_dim, self.rnn_hid_dim, num_layers=self.num_layers, batch_first=True)
+        self.rnn_enc_layer = nn.GRU(
+            self.input_dim,
+            self.rnn_hid_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
+        self.rnn_dec_layer = nn.GRU(
+            self.input_dim,
+            self.rnn_hid_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
         self.fc_layer = nn.Linear(self.rnn_hid_dim, self.input_dim)
 
         # X_p:   batch_size x wnd_dim x input_dim (Encoder input)
         # X_f:   batch_size x wnd_dim x input_dim (Decoder input)
         # h_t:   1 x batch_size x RNN_hid_dim
         # noise: 1 x batch_size x RNN_hid_dim
-    
-    def forward(self, X_p: torch.Tensor, X_f: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+
+    def forward(
+        self, X_p: torch.Tensor, X_f: torch.Tensor, noise: torch.Tensor
+    ) -> torch.Tensor:
         """Do forwars pass through the model.
 
         :param X_p: past window slice
         :param X_f: future window slice
         :param noice: standard Normal noice
         :return: output of the model
-        """ 
+        """
         X_p_enc, h_t = self.rnn_enc_layer(X_p.float())
         X_f_shft = self.shft_right_one(X_f.float())
         hidden = h_t + noise
@@ -284,29 +300,40 @@ class NetG(nn.Module):
         """Shift input tensor to the right and fill the 1st element with zero.
 
         :param X: input tensor
-        returns X_shft: shifted tensor 
+        returns X_shft: shifted tensor
         """
         X_shft = X.clone()
         X_shft[:, 0, :].data.fill_(0)
         X_shft[:, 1:, :] = X[:, :-1, :]
         return X_shft
-    
+
+
 class NetD(nn.Module):
     def __init__(self, args: dict) -> None:
         """Initialize discriminator model.
-        
+
         :param args: dict with all the parameters
         """
         super(NetD, self).__init__()
         self.input_dim = args["model"]["input_dim"]
-        self.rnn_hid_dim = args["model"]['rnn_hid_dim']
+        self.rnn_hid_dim = args["model"]["rnn_hid_dim"]
         self.num_layers = args["model"]["num_layers"]
 
-        self.rnn_enc_layer = nn.GRU(self.input_dim, self.rnn_hid_dim, num_layers=self.num_layers, batch_first=True)
-        self.rnn_dec_layer = nn.GRU(self.rnn_hid_dim, self.input_dim, num_layers=self.num_layers, batch_first=True)
+        self.rnn_enc_layer = nn.GRU(
+            self.input_dim,
+            self.rnn_hid_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
+        self.rnn_dec_layer = nn.GRU(
+            self.rnn_hid_dim,
+            self.input_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
 
     def forward(self, X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Do forward pass through the model.""" 
+        """Do forward pass through the model."""
         X_enc, _ = self.rnn_enc_layer(X.float())
         X_dec, _ = self.rnn_dec_layer(X_enc)
         return X_enc, X_dec
@@ -325,15 +352,27 @@ class VideoNetG(nn.Module):
         self.rnn_hid_dim = args["model"]["rnn_hid_dim"]
         self.num_layers = args["model"]["num_layers"]
 
-        self.rnn_enc_layer = nn.GRU(self.lin_emb_dim, self.rnn_hid_dim, num_layers=self.num_layers, batch_first=True)
-        self.rnn_dec_layer = nn.GRU(self.lin_emb_dim, self.rnn_hid_dim, num_layers=self.num_layers, batch_first=True)
+        self.rnn_enc_layer = nn.GRU(
+            self.lin_emb_dim,
+            self.rnn_hid_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
+        self.rnn_dec_layer = nn.GRU(
+            self.lin_emb_dim,
+            self.rnn_hid_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
         self.fc_layer = nn.Linear(self.rnn_hid_dim, self.input_dim)
 
         # extra linear layer to reduce number of parameters in GRUs
         self.linear_encoder = nn.Linear(self.input_dim, self.lin_emb_dim)
         self.relu = nn.ReLU()
-    
-    def forward(self, X_p: torch.Tensor, X_f: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+
+    def forward(
+        self, X_p: torch.Tensor, X_f: torch.Tensor, noise: torch.Tensor
+    ) -> torch.Tensor:
         """Do forwars pass through the model.
 
         :param X_p: past window slice
@@ -355,27 +394,38 @@ class VideoNetG(nn.Module):
         """Shift input tensor to the right and fill the 1st element with zero.
 
         :param X: input tensor
-        returns X_shft: shifted tensor 
+        returns X_shft: shifted tensor
         """
         X_shft = X.clone()
         X_shft[:, 0, :].data.fill_(0)
         X_shft[:, 1:, :] = X[:, :-1, :]
         return X_shft
-    
+
+
 class VideoNetD(nn.Module):
     def __init__(self, args: dict) -> None:
         """Initialize discriminator model for experiments with videos.
-        
+
         :param args: dict with all the parameters
         """
         super(VideoNetD, self).__init__()
         self.input_dim = args["model"]["input_dim"]
         self.lin_emb_dim = args["model"]["lin_emb_dim"]
-        self.rnn_hid_dim = args["model"]['rnn_hid_dim']
+        self.rnn_hid_dim = args["model"]["rnn_hid_dim"]
         self.num_layers = args["model"]["num_layers"]
 
-        self.rnn_enc_layer = nn.GRU(self.lin_emb_dim, self.rnn_hid_dim, num_layers=self.num_layers, batch_first=True)
-        self.rnn_dec_layer = nn.GRU(self.rnn_hid_dim, self.lin_emb_dim, num_layers=self.num_layers, batch_first=True)
+        self.rnn_enc_layer = nn.GRU(
+            self.lin_emb_dim,
+            self.rnn_hid_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
+        self.rnn_dec_layer = nn.GRU(
+            self.rnn_hid_dim,
+            self.lin_emb_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+        )
 
         # extra linear layers to reduce number of parameters in GRUs
         self.linear_encoder = nn.Linear(self.input_dim, self.lin_emb_dim)
@@ -389,10 +439,11 @@ class VideoNetD(nn.Module):
         X_dec, _ = self.rnn_dec_layer(X_enc)
         X_dec = self.relu(self.linear_decoder(X_dec))
         return X_enc, X_dec
-    
+
 
 class KLCPD(pl.LightningModule):
     """Class for implementation KL-CPD model."""
+
     def __init__(
         self,
         args: dict,
@@ -421,16 +472,16 @@ class KLCPD(pl.LightningModule):
                 "facebookresearch/pytorchvideo:main", "x3d_m", pretrained=True
             )
             self.extractor = nn.Sequential(*list(self.extractor.blocks[:5]))
-            
+
             # freeze extractor parameters
             for param in self.extractor.parameters():
                 param.requires_grad = False
         else:
-            self.extractor = None 
+            self.extractor = None
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
-        
+
         self.batch_size = args["learning"]["batch_size"]
 
         sigma_list = median_heuristic(self.args["loss"]["sqdist"], beta=0.5)
@@ -446,13 +497,15 @@ class KLCPD(pl.LightningModule):
         """Preprocess batch before forwarding (i.e. apply extractor for video input).
 
         :param input: input torch.Tensor
-        :return: processed input tensor to be fed into .forward method 
+        :return: processed input tensor to be fed into .forward method
         """
         if self.args["experiments_name"] in ["explosion", "road_accidents"]:
             input = self.extractor(input.float())  # batch_size, C, seq_len, H, W
             input = input.transpose(1, 2).flatten(2)
         else:
-            input = input.reshape(-1, self.args["model"]['wnd_dim'], self.args["model"]['input_dim'])
+            input = input.reshape(
+                -1, self.args["model"]["wnd_dim"], self.args["model"]["input_dim"]
+            )
         return input
 
     def __initialize_noise(self, batch_size: int) -> torch.Tensor:
@@ -462,22 +515,20 @@ class KLCPD(pl.LightningModule):
         :return: noise
         """
         if np.isscalar(self.args["model"]["rnn_hid_dim"]):
-            noise = torch.FloatTensor(1, batch_size, self.args["model"]["rnn_hid_dim"]).normal_(
-                0, 1
-            )
+            noise = torch.FloatTensor(
+                1, batch_size, self.args["model"]["rnn_hid_dim"]
+            ).normal_(0, 1)
         else:
-            noise = torch.FloatTensor(batch_size, *self.args["model"]["rnn_hid_dim"]).normal_(
-                0, 1
-            )
+            noise = torch.FloatTensor(
+                batch_size, *self.args["model"]["rnn_hid_dim"]
+            ).normal_(0, 1)
         noise.requires_grad = False
         noise = noise.to(self.device)
         return noise
 
     def get_disc_embeddings(
-        self,
-        input_past: torch.Tensor,
-        input_future: torch.Tensor
-        ) -> torch.Tensor:
+        self, input_past: torch.Tensor, input_future: torch.Tensor
+    ) -> torch.Tensor:
         """Pass input through the discriminator network and compute MMD score.
 
         :param input_past: tensor with past slice (len is window_1)
@@ -550,7 +601,10 @@ class KLCPD(pl.LightningModule):
         # update discriminator every step
         if optimizer_idx == 1:
             for param in self.net_discriminator.rnn_enc_layer.parameters():
-                param.data.clamp_(-self.args["learning"]["weight_clip"], self.args["learning"]["weight_clip"])
+                param.data.clamp_(
+                    -self.args["learning"]["weight_clip"],
+                    self.args["learning"]["weight_clip"],
+                )
             optimizer.step(closure=optimizer_closure)
 
     def training_step(
@@ -596,11 +650,11 @@ class KLCPD(pl.LightningModule):
                 self.sigma_var.to(self.device)
             )
             loss_disc = (-1) * loss_disc
-            
+
             self.log("tlD", loss_disc, prog_bar=True)
             self.log("train_mmd2_real_D", mmd2_real, prog_bar=True)
-            
-            #if batch_idx % 5 == 0:
+
+            # if batch_idx % 5 == 0:
             #    print("mmd2_real:", mmd2_real)
             #    print("loss_disc:", loss_disc)
 
@@ -614,13 +668,11 @@ class KLCPD(pl.LightningModule):
             ]
 
             # batch-wise MMD2 loss between input_future and fake_future
-            gen_mmd2 = batch_mmd2_loss(
-                *all_future_enc, self.sigma_var.to(self.device)
-            )
+            gen_mmd2 = batch_mmd2_loss(*all_future_enc, self.sigma_var.to(self.device))
             loss_gen = gen_mmd2.mean()
             self.log("tlG", loss_gen, prog_bar=True)
-            
-            #if batch_idx % 5 == 0:
+
+            # if batch_idx % 5 == 0:
             #    print("loss_disc:", loss_gen)
 
             return loss_gen
